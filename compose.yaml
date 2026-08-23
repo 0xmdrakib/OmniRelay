@@ -1,0 +1,113 @@
+name: omnirelay
+
+x-default-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "5"
+
+services:
+  caddy:
+    image: caddy:2.10.2-alpine
+    profiles: ["production"]
+    restart: unless-stopped
+    depends_on:
+      backend:
+        condition: service_healthy
+      livekit:
+        condition: service_started
+    environment:
+      RELAY_DOMAIN: ${RELAY_DOMAIN:-relay.example.invalid}
+      LIVEKIT_DOMAIN: ${LIVEKIT_DOMAIN:-livekit.example.invalid}
+    volumes:
+      - ./deploy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    ports:
+      - "80:80"
+      - "443:443"
+    logging: *default-logging
+
+  postgres:
+    image: postgres:17.10-alpine3.24
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: omnirelay
+      POSTGRES_USER: omnirelay
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U omnirelay -d omnirelay"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    logging: *default-logging
+
+  backend:
+    build:
+      context: ./backend
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      NODE_ENV: production
+      PORT: 8080
+      DATABASE_URL: postgres://omnirelay:${POSTGRES_PASSWORD}@postgres:5432/omnirelay
+      LIVEKIT_URL: ${LIVEKIT_PUBLIC_URL:?Set LIVEKIT_PUBLIC_URL in .env}
+      LIVEKIT_API_KEY: ${LIVEKIT_API_KEY:?Set LIVEKIT_API_KEY in .env}
+      LIVEKIT_API_SECRET: ${LIVEKIT_API_SECRET:?Set LIVEKIT_API_SECRET in .env}
+      FIREBASE_SERVICE_ACCOUNT_JSON: ${FIREBASE_SERVICE_ACCOUNT_JSON:-}
+      TRUST_PROXY: ${TRUST_PROXY:-false}
+    ports:
+      - "${BACKEND_BIND_ADDRESS:-127.0.0.1}:${BACKEND_PORT:-8080}:8080"
+    init: true
+    read_only: true
+    tmpfs:
+      - /tmp:size=64m,noexec,nosuid,nodev
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:8080/healthz').then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+    logging: *default-logging
+
+  livekit:
+    image: livekit/livekit-server:v1.13.1
+    restart: unless-stopped
+    command: ["--config", "/etc/livekit.yaml"]
+    volumes:
+      - ./deploy/livekit.generated.yaml:/etc/livekit.yaml:ro
+    ports:
+      - "${LIVEKIT_HTTP_BIND_ADDRESS:-127.0.0.1}:7880:7880"
+      - "7881:7881"
+      - "50000-50100:50000-50100/udp"
+    logging: *default-logging
+
+  coturn:
+    image: coturn/coturn:4.15.0-r0
+    restart: unless-stopped
+    network_mode: host
+    command:
+      - --fingerprint
+      - --use-auth-secret
+      - --static-auth-secret=${TURN_SHARED_SECRET:?Set TURN_SHARED_SECRET in .env}
+      - --realm=${TURN_REALM:?Set TURN_REALM in .env}
+      - --external-ip=${PUBLIC_HOST:?Set PUBLIC_HOST in .env}
+      - --listening-port=3478
+      - --min-port=49160
+      - --max-port=49200
+      - --no-cli
+      - --no-multicast-peers
+      - --stale-nonce=600
+    logging: *default-logging
+
+volumes:
+  postgres_data:
+  caddy_data:
+  caddy_config:

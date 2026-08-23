@@ -1,0 +1,38 @@
+# IDE, OS and local build state
+.gradle/
+.kotlin/
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+**/build/
+local.properties
+.tmp_*/
+
+# Node/pnpm state
+**/node_modules/
+**/.pnpm-store/
+backend/node_modules.docker-broken/
+backend/dist/
+*.log
+
+# Runtime configuration and credentials
+.env
+.env.*
+!.env.example
+app/google-services.json
+**/firebase-admin*.json
+**/*service-account*.json
+deploy/livekit.generated.yaml
+*.jks
+*.keystore
+*.p12
+*.pfx
+*.pem
+*.key
+
+# Generated application artifacts
+*.apk
+*.aab
+*.aar
+captures/
