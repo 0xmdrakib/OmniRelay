@@ -1,118 +1,108 @@
 # OmniRelay
 
-OmniRelay is a native Android E2EE messaging and audio-calling client with
-internet relay plus nearby Wi-Fi Aware/BLE fallback.
+OmniRelay is a native Android app for private, end-to-end encrypted messaging
+and voice calls, with a self-hosted internet relay and nearby radio fallback.
 
-## Build a LAN test APK
+**Status:** Pre-release · Android 8.0+ · Physical-device validation pending
 
-Build artifacts are intentionally excluded from Git. Create a debug APK for
-your current PC address:
+---
 
-```powershell
-$env:JAVA_HOME='C:\Program Files\Android\Android Studio\jbr'
-.\gradlew.bat assembleDebug -POMNIRELAY_BACKEND_URL=http://YOUR_PC_IP:8080
-```
+## Overview
 
-The APK is generated at `app/build/outputs/apk/debug/app-debug.apk`.
+OmniRelay is built around two connection modes:
 
-Keep Docker Desktop and this PC on, keep both phones on the same reachable
-network, install the APK on both phones, grant notifications/microphone/nearby
-permissions, then exchange each phone's Secret Link in Settings. If Windows
-Firewall prompts, allow Docker/Java on the private network. The local services
-use ports 8080, 7880, 7881, 3478/UDP, 49160-49200/UDP, and 50000-50100/UDP.
+- **Internet relay:** Encrypted messages and call signaling over HTTPS and
+  WebSocket, optional Firebase push wake-ups, and LiveKit/WebRTC voice calls.
+- **Nearby connection:** Direct communication over Wi-Fi Aware and Bluetooth
+  LE GATT when supported devices are within radio range.
 
-For LAN testing set `BACKEND_BIND_ADDRESS=0.0.0.0`,
-`LIVEKIT_HTTP_BIND_ADDRESS=0.0.0.0`, `TRUST_PROXY=false`, and
-`LIVEKIT_PUBLIC_URL=ws://YOUR_PC_IP:7880` in the untracked `.env`. Render
-`deploy/livekit.generated.yaml` with the same IP.
+Contacts pair by exchanging Secret Links. The app accepts incoming content
+only from locally paired identities and keeps raw discovery nodes out of the
+contact list.
 
-## Local server
+## Features
 
-Copy `.env.example` to the ignored `.env`, replace every placeholder with a
-strong unique value, then render the LiveKit config:
+- Mutual Secret Link pairing with custom contact names
+- End-to-end encrypted messages and Keystore-protected local message storage
+- Persistent chat history with queued, sent, delivered, and read states
+- Durable message retries, delivery acknowledgements, and deduplication
+- Ring, accept, decline, and end-call signaling with mute and speaker controls
+- LiveKit/WebRTC audio with per-call media encryption and TURN fallback
+- Incoming-call notifications and Android Telecom integration
+- Optional FCM wake-ups without message or call plaintext in push payloads
+- Wi-Fi Aware discovery, BLE presence, GATT transport, and packet reassembly
+- Self-hosted backend with authenticated devices, mailbox quotas, and rate limits
 
-```powershell
-.\deploy\render-config.ps1 `
-  -PublicHost 'YOUR_PC_IP' `
-  -LiveKitApiKey 'omnirelay' `
-  -LiveKitApiSecret 'A_LONG_RANDOM_SECRET' `
-  -TurnSharedSecret 'ANOTHER_LONG_RANDOM_SECRET'
+## Connection behavior
 
-docker compose up -d --build
-```
+| Receiver condition | Available path | Expected behavior |
+| --- | --- | --- |
+| Internet connection available | HTTPS, WebSocket, optional FCM, and LiveKit | Online messaging and calls |
+| No internet, but a compatible peer is nearby | Wi-Fi Aware or BLE GATT | Direct nearby communication |
+| Temporarily unreachable | Local outbox and server mailbox | Messages wait and retry when a path returns |
+| No internet and no reachable nearby radio | No communication path | No instant delivery or live call |
 
-Check health with:
+Nearby mode does not require a SIM or an internet connection. It still requires
+compatible hardware, permissions, and radio range. A sender's internet alone
+cannot reach a distant receiver that has no network path.
 
-```powershell
-Invoke-RestMethod http://127.0.0.1:8080/healthz
-docker compose ps
-```
+## Tech stack
 
-## Public production deployment
+- **Android:** Kotlin, Jetpack Compose, Room, WorkManager, and Core Telecom
+- **Cryptography:** X25519, HKDF-SHA256, AES-256-GCM, Ed25519, and Android Keystore
+- **Connectivity:** OkHttp, Firebase Cloud Messaging, Wi-Fi Aware, and BLE GATT
+- **Voice:** LiveKit/WebRTC, coturn, and IMA-ADPCM for nearby audio
+- **Backend:** Node.js 24, TypeScript, Fastify, WebSocket, and PostgreSQL
+- **Infrastructure:** Docker Compose, Caddy TLS, and GitHub Actions
 
-1. Point `RELAY_DOMAIN` and `LIVEKIT_DOMAIN` DNS records to a public server.
-2. Generate ignored production configuration and strong random secrets:
+## Getting started
 
-   ```powershell
-   .\deploy\initialize-production.ps1 `
-     -PublicIp 'YOUR_PUBLIC_IP' `
-     -RelayDomain 'relay.example.com' `
-     -LiveKitDomain 'livekit.example.com'
-   ```
-
-3. Optionally add the one-line Firebase service-account JSON to the generated
-   `.env` as `FIREBASE_SERVICE_ACCOUNT_JSON`.
-4. Open TCP 80, 443, 7881 and UDP 3478, 49160-49200, 50000-50100.
-5. Run `.\deploy\start-production.ps1`. It validates configuration, builds the
-   stack, waits for health, and Caddy obtains TLS certificates for both domains.
-6. Create an Android app in Firebase, enable Cloud Messaging, and supply its
-   four client values as Gradle properties. Put the service-account JSON on one
-   line in `FIREBASE_SERVICE_ACCOUNT_JSON` in the server `.env`.
-
-Build Android with:
+Clone the private repository using an account with access:
 
 ```powershell
-.\gradlew.bat assembleRelease `
-  -POMNIRELAY_BACKEND_URL=https://RELAY_DOMAIN `
-  -POMNIRELAY_FIREBASE_API_KEY=... `
-  -POMNIRELAY_FIREBASE_APP_ID=... `
-  -POMNIRELAY_FIREBASE_PROJECT_ID=... `
-  -POMNIRELAY_FIREBASE_SENDER_ID=...
+git clone https://github.com/0xmdrakib/OmniRelay.git
+cd OmniRelay
 ```
 
-For a signed release also provide `OMNIRELAY_KEYSTORE_FILE`,
-`OMNIRELAY_KEYSTORE_PASSWORD`, `OMNIRELAY_KEY_ALIAS`, and
-`OMNIRELAY_KEY_PASSWORD` in the user's Gradle properties, never in source.
+Follow the [setup guide](docs/SETUP.md) to start the local server, build a
+configured APK, and pair two Android phones. For a public server, use the
+[production deployment guide](docs/SETUP.md#production-deployment).
 
-Before the first Play Store release, replace the placeholder application ID
-`com.example.omnirelay` with a permanent ID you control. An application ID
-cannot be changed after publishing under that identity.
+Credentials, signing keys, local configuration, and build artifacts stay outside
+Git. Keep the repository private and store deployment secrets on the server or
+in a secrets manager.
 
-## Repository security
+## Testing and release
 
-The repository intentionally excludes local SDK paths, runtime `.env` files,
-Firebase configs/service accounts, generated LiveKit config, signing keys,
-logs, databases, and APK/AAB artifacts. GitHub Actions runs secret scanning,
-backend integration tests, Android tests/lint, and debug/release builds.
-Dependabot monitors Gradle, pnpm, GitHub Actions, and the backend Docker image.
+The [CI workflow](.github/workflows/ci.yml) runs Android unit tests, lint,
+debug/release builds, backend checks and integration tests, a Docker image
+build, and full-history secret scanning. See the [test commands](docs/SETUP.md#tests)
+to run the checks locally.
 
-Keep this repository private. Store deployment values in the server's `.env`
-or a secrets manager and release-signing values in the user-level Gradle
-properties or CI secrets—never in tracked files.
+This is not yet a production release. Two-phone audio, nearby transport,
+background delivery, and real Firebase/public-network behavior still need
+physical-device testing. Automated checks do not establish those guarantees.
 
-## Tests
+The message protocol uses long-lived contact keys and does not currently offer
+Double Ratchet forward secrecy. Review the [threat model](docs/THREAT_MODEL.md)
+and complete the [release checklist](docs/RELEASE_CHECKLIST.md) before launch.
 
-```powershell
-$env:JAVA_HOME='C:\Program Files\Android\Android Studio\jbr'
-.\gradlew.bat testDebugUnitTest assembleDebug
+## Documentation
 
-cd backend
-npx pnpm install --frozen-lockfile
-npx pnpm build
-$env:INTEGRATION_BASE_URL='http://127.0.0.1:8080'
-node --test --import tsx test/*.test.ts
-```
+- [Setup and deployment](docs/SETUP.md) — prerequisites, local testing, Firebase,
+  signing, production setup, and test commands
+- [Production architecture](docs/PRODUCTION_ARCHITECTURE.md) — delivery paths,
+  components, API routes, and security boundaries
+- [Threat model](docs/THREAT_MODEL.md) — protections, trust boundaries, and limitations
+- [Release checklist](docs/RELEASE_CHECKLIST.md) — infrastructure, device validation,
+  security review, and distribution
 
-See [production architecture](docs/PRODUCTION_ARCHITECTURE.md), the
-[threat model](docs/THREAT_MODEL.md), and the
-[release checklist](docs/RELEASE_CHECKLIST.md) before deployment.
+---
+
+## License
+
+Copyright (c) 2026 OmniRelay. All rights reserved.
+
+This project is **proprietary and confidential**, not open source. Use, copying,
+modification, distribution, sublicensing, or publication requires prior written
+authorization from the copyright holder. See the [license terms](LICENSE).

@@ -33,7 +33,7 @@
 
 ## Security gate
 
-- [ ] GitHub CI, Dependabot, secret scan, lint, tests, and release build pass.
+- [ ] GitHub CI, dependency review, secret scan, lint, tests, and release build pass.
 - [ ] `pnpm audit --prod` and Docker Scout report no high/critical findings.
 - [ ] Rotate any credential ever used outside its intended environment.
 - [ ] Complete independent mobile/backend/protocol/infrastructure review.
