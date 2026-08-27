@@ -102,7 +102,3 @@ and complete the [release checklist](docs/RELEASE_CHECKLIST.md) before launch.
 ## License
 
 Copyright (c) 2026 OmniRelay. All rights reserved.
-
-This project is **proprietary and confidential**, not open source. Use, copying,
-modification, distribution, sublicensing, or publication requires prior written
-authorization from the copyright holder. See the [license terms](LICENSE).
