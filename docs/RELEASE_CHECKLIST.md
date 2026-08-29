@@ -18,18 +18,35 @@
 - [ ] Start with `start-production.ps1` and verify Caddy TLS and `/healthz`.
 - [ ] Configure encrypted PostgreSQL backups and test a restore.
 - [ ] Configure uptime, disk, certificate, container, and error monitoring.
+- [ ] Load-test the intended small-host profile, record p95 latency and database
+      saturation, and lower admission limits before adding server capacity.
+- [ ] Verify cleanup remains batched and that overload returns bounded `503`
+      responses instead of exhausting the process or database.
 
 ## Device validation
 
 - [ ] Test two different physical Android devices on the same LAN.
 - [ ] Test devices on separate mobile/Wi-Fi networks through TURN.
 - [ ] Verify message queued/sent/delivered/read transitions.
+- [ ] Verify an unpaired registered/Sybil device receives `403`, pairing enables
+      delivery, and deleting the contact revokes its inbound route.
 - [ ] Verify incoming ring, accept, decline, cancel, end, mute, speaker, and
       two-way app-level E2EE audio.
+- [ ] Kill each participant during an active internet call and confirm the short
+      server lease expires without a ghost active session.
 - [ ] Verify BLE and Wi-Fi Aware fallback with internet disabled.
+- [ ] Test three physical phones: sender, opted-in volunteer, and receiver. Verify
+      successful simultaneous opportunistic forwarding, duplicate suppression, hop expiry, tamper
+      rejection, relay opt-out, and that no live voice is sent through the volunteer.
+- [ ] Validate MINIMAL/BALANCED/GENEROUS behavior while charging, on battery,
+      metered/unmetered, in power-save, under thermal pressure, and during a call.
+- [ ] Verify each permission can be denied independently without crashes or
+      blocking unrelated internet messaging.
 - [ ] Verify reboot, process death, Doze, notification denial, and OEM battery
       restrictions.
 - [ ] Verify Android 8/API 26 and Android 13+/API 33 crypto initialization.
+- [ ] Corrupt a test identity wrapper and confirm the app fails closed and offers
+      recovery guidance without silently creating a new identity.
 
 ## Security gate
 
@@ -37,6 +54,12 @@
 - [ ] `pnpm audit --prod` and Docker Scout report no high/critical findings.
 - [ ] Rotate any credential ever used outside its intended environment.
 - [ ] Complete independent mobile/backend/protocol/infrastructure review.
+- [ ] Replace stable discovery prefixes with rotating unlinkable tokens.
+- [ ] Complete and independently review the forward-secure protocol described in
+      `SECURITY_EVOLUTION.md`; define migration and downgrade resistance.
+- [ ] Validate the encrypted Wi-Fi Aware NDP on at least two API 29+ OEMs for
+      simultaneous setup, reconnect, sustained throughput, battery, and abuse;
+      independently review or replace its custom secure-record protocol.
 - [ ] Document incident response, key rotation, data retention, and account
       ownership.
 

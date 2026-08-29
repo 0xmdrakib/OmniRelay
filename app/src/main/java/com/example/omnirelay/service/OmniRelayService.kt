@@ -8,6 +8,8 @@ import android.app.Service
 import android.content.Context
 import android.content.Intent
 import android.content.pm.ServiceInfo
+import android.bluetooth.le.AdvertiseSettings
+import android.bluetooth.le.ScanSettings
 import android.media.Ringtone
 import android.media.RingtoneManager
 import android.os.Binder
@@ -32,17 +34,27 @@ import com.example.omnirelay.media.VoiceStreamEngine
 import com.example.omnirelay.media.TelecomCallManager
 import com.example.omnirelay.network.CallStateRequest
 import com.example.omnirelay.network.InternetRelayClient
+import com.example.omnirelay.network.OutboundRetryPolicy
+import com.example.omnirelay.network.RelayHttpException
 import com.example.omnirelay.network.RelaySyncWorker
 import com.example.omnirelay.network.SendEnvelopeRequest
 import com.example.omnirelay.protocol.CryptoEngine
 import com.example.omnirelay.protocol.OmniFrame
+import com.example.omnirelay.protocol.OmniFrameCipher
+import com.example.omnirelay.protocol.RelayCapsule
+import com.example.omnirelay.protocol.RelayReplayTracker
 import com.example.omnirelay.radio.BleMeshManager
 import com.example.omnirelay.radio.OmniRelayBackgroundScanner
 import com.example.omnirelay.radio.PeerDiscoveryRegistry
 import com.example.omnirelay.radio.WifiAwareMeshManager
 import com.example.omnirelay.routing.MultiPathRouter
 import com.example.omnirelay.routing.TransportPath
+import com.example.omnirelay.routing.AdaptiveResourcePolicy
+import com.example.omnirelay.routing.AndroidResourceMonitor
+import com.example.omnirelay.routing.HourlyByteBudget
+import com.example.omnirelay.routing.FixedWindowRateLimit
 import com.example.omnirelay.utils.SettingsManager
+import com.example.omnirelay.utils.IdentityUnavailableException
 import com.example.omnirelay.utils.LocalMessageProtector
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -50,10 +62,19 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
+import java.util.LinkedHashMap
+import java.util.concurrent.ConcurrentHashMap
+import java.nio.ByteBuffer
+import java.nio.ByteOrder
+import java.util.concurrent.atomic.AtomicLong
 import java.util.UUID
 import java.util.concurrent.TimeUnit
 import java.security.MessageDigest
@@ -62,6 +83,13 @@ data class CallInvite(
     val callerId: String,
     val callerPublicKey: String,
     val timestampMs: Long = System.currentTimeMillis()
+)
+
+private data class NearbyVoicePayload(
+    val callId: String,
+    val counter: Long,
+    val codec: Byte,
+    val audio: ByteArray
 )
 
 /** Owns nearby transports, secure framing, call state and notifications. */
@@ -75,6 +103,7 @@ class OmniRelayService : Service() {
         const val NOTIFICATION_ID = 0x99
         const val CALL_NOTIFICATION_ID = 0x101
         const val MSG_NOTIFICATION_ID = 0x102
+        const val IDENTITY_NOTIFICATION_ID = 0x103
 
         const val ACTION_ACCEPT_CALL = "com.example.omnirelay.ACTION_ACCEPT_CALL"
         const val ACTION_DECLINE_CALL = "com.example.omnirelay.ACTION_DECLINE_CALL"
@@ -83,8 +112,21 @@ class OmniRelayService : Service() {
         const val ACTION_UPDATE_PUSH_TOKEN = "com.example.omnirelay.ACTION_UPDATE_PUSH_TOKEN"
         const val EXTRA_PUSH_TOKEN = "push_token"
 
-        private const val RECIPIENT_PREFIX_SIZE = 8
         private const val MAX_TEXT_BYTES = 60_000
+        private const val OUTGOING_RING_TIMEOUT_MS = 60_000L
+        private const val CALL_SIGNAL_MAX_AGE_MS = 60_000L
+        private const val CALL_SIGNAL_MAX_FUTURE_SKEW_MS = 15_000L
+        private const val CALL_LEASE_RENEW_INTERVAL_MS = 45_000L
+        private const val MAX_NEARBY_PACKETS_PER_SECOND = 200
+        private const val MAX_VOICE_PACKETS_PER_SECOND = 100
+        private const val MAX_VOICE_COUNTER_JUMP = 500L
+        private const val VOICE_HEADER_BYTES = 25
+        private const val VOICE_CODEC_ADPCM: Byte = 0x01
+        private const val VOICE_CODEC_PCM16: Byte = 0x02
+        private const val MAX_VOLUNTEER_RELAY_PACKET_BYTES = 20 * 1024
+        private const val MAX_VOLUNTEER_RELAY_INNER_BYTES = 20_000
+        private const val MAX_RELAY_PACKETS_PER_MINUTE = 240
+        private const val MAX_RELAY_FANOUT_RESERVATION = 16
     }
 
     private val binder = LocalBinder()
@@ -107,13 +149,33 @@ class OmniRelayService : Service() {
     val callDurationSeconds: StateFlow<Int> get() = voiceEngine.callDurationSeconds
 
     private var ringtonePlayer: Ringtone? = null
-    private var activePeerPublicKey: ByteArray? = null
-    private var activeCallId: String? = null
+    private val callState = CallStateMachine()
+    private val voiceCounterLock = Any()
+    private val activeCallId: String? get() = callState.snapshot()?.callId
+    private val activePeerPublicKey: ByteArray? get() = callState.snapshot()?.peerPublicKey
     private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private lateinit var database: OmniDatabase
     private lateinit var relayClient: InternetRelayClient
     private lateinit var telecomCallManager: TelecomCallManager
     private lateinit var messageProtector: LocalMessageProtector
+    private lateinit var resourceMonitor: AndroidResourceMonitor
+    private val relayByteBudget = HourlyByteBudget()
+    private val relayPacketRate = FixedWindowRateLimit(60_000L)
+    private val nearbyPacketRate = FixedWindowRateLimit(1_000L)
+    private val voicePacketRate = FixedWindowRateLimit(1_000L)
+    private val outboxMutex = Mutex()
+    private val mailboxSyncMutex = Mutex()
+    private val pairSharedKeyCache = ConcurrentHashMap<String, ByteArray>()
+    private val relayReplayTracker = RelayReplayTracker(4_096)
+    private val seenVoiceFrames = LinkedHashMap<String, Unit>(8_192, 0.75f, true)
+    private var bleScanDutyJob: Job? = null
+    private var bleAdvertiseDutyJob: Job? = null
+    private var incomingRingTimeoutJob: Job? = null
+    private var callLeaseJob: Job? = null
+    private val outgoingVoiceCounter = AtomicLong(0)
+    @Volatile private var lastIncomingVoiceCounter = -1L
+    @Volatile private var appInForeground = false
+    @Volatile private var initializationFailed = false
 
     inner class LocalBinder : Binder() {
         fun getService(): OmniRelayService = this@OmniRelayService
@@ -123,12 +185,34 @@ class OmniRelayService : Service() {
         super.onCreate()
         createNotificationChannels()
         settingsManager = SettingsManager(this)
-        keyPair = settingsManager.getMyIdentity()
+        resourceMonitor = AndroidResourceMonitor(this)
+        keyPair = try {
+            settingsManager.getMyIdentity()
+        } catch (error: IdentityUnavailableException) {
+            initializationFailed = true
+            Log.e(TAG, "Protected identity is unavailable; radio and relay startup aborted", error)
+            postIdentityRecoveryNotification()
+            stopSelf()
+            return
+        }
         database = OmniDatabase.get(this)
         messageProtector = LocalMessageProtector()
         relayClient = InternetRelayClient(this)
         bleMeshManager = BleMeshManager(this)
-        wifiAwareMeshManager = WifiAwareMeshManager(this, keyPair.publicKey)
+        wifiAwareMeshManager = WifiAwareMeshManager(
+            context = this,
+            identityPublicKey = keyPair.publicKey,
+            peerCredentialsProvider = credentials@{ publicKeyPrefix ->
+                val contact = settingsManager.getPairedContactForPrefix(publicKeyPrefix)
+                    ?: return@credentials null
+                val peerPublicKey = settingsManager.decodePublicKey(contact.secretLink)
+                    ?: return@credentials null
+                val sharedSecret = runCatching {
+                    sharedKeyWith(peerPublicKey)
+                }.getOrNull() ?: return@credentials null
+                WifiAwareMeshManager.PeerCredentials(peerPublicKey, sharedSecret)
+            }
+        )
         router = MultiPathRouter()
         voiceEngine = VoiceStreamEngine(
             enableEchoCancellation = settingsManager.isEchoCancellationEnabled,
@@ -141,10 +225,35 @@ class OmniRelayService : Service() {
             onSystemDisconnect = { stopVoiceCall(fromTelecom = true) }
         )
 
-        voiceEngine.onVoiceBurstGenerated = voice@{ compressedBurst ->
-            val target = activePeerPublicKey ?: return@voice
+        voiceEngine.onVoiceBurstGenerated = voice@{ compressedBurst, pcmBurst ->
+            val call = callState.snapshot()?.takeIf { it.phase == CallStateMachine.Phase.ACTIVE }
+                ?: return@voice
+            val target = call.peerPublicKey
+            val callId = call.callId
             runCatching {
-                sendNearbyFrame(target, buildSecureFrame(OmniFrame.PAYLOAD_TYPE_VOICE, target, compressedBurst))
+                val counter = outgoingVoiceCounter.getAndIncrement()
+                val sentLossless = settingsManager.isWifiAwareEnabled &&
+                    wifiAwareMeshManager.hasHighBandwidthChannel(target) &&
+                    wifiAwareMeshManager.sendHighBandwidthFrame(
+                        target,
+                        buildSecureFrame(
+                            OmniFrame.PAYLOAD_TYPE_VOICE,
+                            target,
+                            encodeVoicePayload(callId, counter, VOICE_CODEC_PCM16, pcmBurst)
+                        )
+                    )
+                if (!sentLossless && settingsManager.isBleEnabled) {
+                    val adpcmPayload = encodeVoicePayload(
+                        callId,
+                        counter,
+                        VOICE_CODEC_ADPCM,
+                        compressedBurst
+                    )
+                    bleMeshManager.sendFrame(
+                        target,
+                        buildSecureFrame(OmniFrame.PAYLOAD_TYPE_VOICE, target, adpcmPayload)
+                    )
+                }
             }.onFailure { Log.e(TAG, "Nearby voice frame failed", it) }
         }
 
@@ -156,7 +265,9 @@ class OmniRelayService : Service() {
         }
 
         bleMeshManager.onFrameReceivedListener = { frameBytes, rssi ->
-            serviceScope.launch { handleReceivedFrame(frameBytes, rssi) }
+            if (nearbyPacketRate.tryAcquire(MAX_NEARBY_PACKETS_PER_SECOND)) {
+                serviceScope.launch { handleNearbyPacket(frameBytes, rssi) }
+            }
         }
         wifiAwareMeshManager.onPeerDiscoveredListener = { publicKeyPrefix ->
             settingsManager.getPairedContactForPrefix(publicKeyPrefix)?.let { contact ->
@@ -170,7 +281,9 @@ class OmniRelayService : Service() {
             }
         }
         wifiAwareMeshManager.onFrameReceivedListener = { frameBytes ->
-            serviceScope.launch { handleReceivedFrame(frameBytes, rssi = -45) }
+            if (nearbyPacketRate.tryAcquire(MAX_NEARBY_PACKETS_PER_SECOND)) {
+                serviceScope.launch { handleNearbyPacket(frameBytes, rssi = -45) }
+            }
         }
 
         serviceScope.launch {
@@ -187,6 +300,7 @@ class OmniRelayService : Service() {
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        if (initializationFailed) return START_NOT_STICKY
         startForegroundServiceNotification(includeMicrophone = false)
         when (intent?.action) {
             ACTION_ACCEPT_CALL -> acceptIncomingCall()
@@ -198,17 +312,13 @@ class OmniRelayService : Service() {
             }
         }
 
-        if (settingsManager.isBleEnabled) {
-            bleMeshManager.startActiveScanning()
-            val presence = OmniFrame(
-                payloadType = OmniFrame.PAYLOAD_TYPE_PRESENCE,
-                ephemeralPublicKey = keyPair.publicKey
-            ).packCompact()
-            bleMeshManager.startAdvertising(presence)
-            OmniRelayBackgroundScanner.registerPendingIntentScanner(this)
-        }
-        if (settingsManager.isWifiAwareEnabled) wifiAwareMeshManager.attachToNANCluster()
+        applyResourcePolicy()
         return START_STICKY
+    }
+
+    fun setAppInForeground(isForeground: Boolean) {
+        appInForeground = isForeground
+        applyResourcePolicy()
     }
 
     fun initiateCall(targetAddress: String) {
@@ -217,84 +327,135 @@ class OmniRelayService : Service() {
             appendChatMessage("Call failed: invalid Secret Link")
             return
         }
-        activePeerPublicKey = target
         val callId = UUID.randomUUID().toString()
-        activeCallId = callId
+        if (callState.beginOutgoing(callId, target) == null) {
+            appendChatMessage("Another call is already in progress")
+            return
+        }
+        outgoingVoiceCounter.set(0)
+        synchronized(voiceCounterLock) { lastIncomingVoiceCounter = -1L }
+        applyResourcePolicy()
         telecomCallManager.reportOutgoing(settingsManager.getContactNameForLink(targetAddress), callId)
         appendChatMessage("Outgoing call ringing")
         serviceScope.launch {
-            val frame = buildSecureFrame(OmniFrame.PAYLOAD_TYPE_CALL_RING, target, ByteArray(0))
+            if (!callState.matches(callId, target, CallStateMachine.Phase.OUTGOING_RINGING)) {
+                return@launch
+            }
+            val frame = buildSecureFrame(OmniFrame.PAYLOAD_TYPE_CALL_RING, target, encodeCallId(callId))
             val envelopeId = UUID.randomUUID().toString()
             val sentInternet = sendInternetEnvelope(frame, target, "call", callId, envelopeId)
-            val sentNearby = !sentInternet && sendNearbyFrame(target, frame)
-            if (sentNearby) database.omniDao().setOutboundState(envelopeId, OutboundEnvelopeEntity.STATE_SENT)
+            val sentNearby = !sentInternet &&
+                callState.matches(callId, target, CallStateMachine.Phase.OUTGOING_RINGING) &&
+                sendNearbyFrame(target, frame)
+            if (sentNearby) database.omniDao().markOutboundSentIfPending(envelopeId)
             val sent = sentInternet || sentNearby
             if (!sent) appendChatMessage("Call queued: waiting for a network path")
+        }
+        serviceScope.launch {
+            delay(OUTGOING_RING_TIMEOUT_MS)
+            if (callState.expire(callId, CallStateMachine.Phase.OUTGOING_RINGING) != null) {
+                database.omniDao().cancelPendingCall(callId)
+                telecomCallManager.disconnect(android.telecom.DisconnectCause.CANCELED)
+                applyResourcePolicy()
+                appendChatMessage("Outgoing call timed out")
+            }
         }
     }
 
     fun acceptIncomingCall(fromTelecom: Boolean = false) {
-        val invite = _incomingCallState.value ?: return
-        val target = settingsManager.decodePublicKey(invite.callerPublicKey) ?: return
+        val invite = _incomingCallState.value
+        val call = callState.beginLocalAccept() ?: return
+        val target = call.peerPublicKey
         stopRingtone()
+        incomingRingTimeoutJob?.cancel()
         cancelNotification(CALL_NOTIFICATION_ID)
         _incomingCallState.value = null
-        activePeerPublicKey = target
         if (!fromTelecom) telecomCallManager.answer()
         serviceScope.launch {
-            val frame = buildSecureFrame(OmniFrame.PAYLOAD_TYPE_CALL_ACCEPT, target, ByteArray(0))
-            val callId = activeCallId
-            val internetSent = if (callId != null) transitionInternetCall(callId, "active", frame) else false
+            val callId = call.callId
+            val frame = buildSecureFrame(OmniFrame.PAYLOAD_TYPE_CALL_ACCEPT, target, encodeCallId(callId))
+            val internetSent = transitionInternetCall(callId, "active", frame, target)
             if (internetSent) {
-                connectInternetMedia(callId!!)
-                appendChatMessage("Call connected with [${invite.callerId}]")
-            } else if (sendNearbyFrame(target, frame)) {
-                startVoiceMedia()
-                appendChatMessage("Call connected with [${invite.callerId}]")
+                if (callState.matches(callId, target, CallStateMachine.Phase.CONNECTING)) {
+                    connectInternetMedia(callId, target)
+                    appendChatMessage("Call connected with [${invite?.callerId ?: "Peer"}]")
+                }
+            } else if (callState.matches(callId, target, CallStateMachine.Phase.CONNECTING) &&
+                sendNearbyFrame(target, frame)
+            ) {
+                startVoiceMedia(callId, target)
+                appendChatMessage("Call connected with [${invite?.callerId ?: "Peer"}]")
             } else {
-                activePeerPublicKey = null
-                appendChatMessage("Unable to answer: peer connection lost")
+                val cleared = callState.terminateRemote(
+                    callId,
+                    target,
+                    CallStateMachine.Phase.CONNECTING
+                )
+                if (cleared != null) {
+                    applyResourcePolicy()
+                    appendChatMessage("Unable to answer: peer connection lost")
+                }
             }
         }
     }
 
     fun declineIncomingCall() {
         val invite = _incomingCallState.value
-        val callIdToDecline = activeCallId
+        val call = callState.terminateLocal(CallStateMachine.Phase.INCOMING_RINGING) ?: return
         stopRingtone()
+        incomingRingTimeoutJob?.cancel()
         cancelNotification(CALL_NOTIFICATION_ID)
         _incomingCallState.value = null
-        invite?.let { callInvite ->
-            settingsManager.decodePublicKey(callInvite.callerPublicKey)?.let { target ->
-                serviceScope.launch {
-                    val frame = buildSecureFrame(OmniFrame.PAYLOAD_TYPE_CALL_DECLINE, target, ByteArray(0))
-                    val transitioned = callIdToDecline?.let { transitionInternetCall(it, "declined", frame) } == true
-                    if (!transitioned) sendNearbyFrame(target, frame)
-                }
+        serviceScope.launch {
+            val frame = buildSecureFrame(
+                OmniFrame.PAYLOAD_TYPE_CALL_DECLINE,
+                call.peerPublicKey,
+                encodeCallId(call.callId)
+            )
+            val transitioned = transitionInternetCall(
+                call.callId,
+                "declined",
+                frame,
+                call.peerPublicKey
+            )
+            if (!transitioned) {
+                sendNearbyFrame(call.peerPublicKey, frame)
             }
         }
-        activeCallId = null
+        applyResourcePolicy()
         telecomCallManager.disconnect(android.telecom.DisconnectCause.REJECTED)
         appendChatMessage("Call rejected [${invite?.callerId ?: "Peer"}]")
     }
 
     fun stopVoiceCall(fromTelecom: Boolean = false) {
-        val callIdToEnd = activeCallId
-        activePeerPublicKey?.let { target ->
+        val call = callState.terminateLocal()
+        callLeaseJob?.cancel()
+        callLeaseJob = null
+        call?.let { ended ->
             serviceScope.launch {
-                val frame = buildSecureFrame(OmniFrame.PAYLOAD_TYPE_CALL_END, target, ByteArray(0))
-                val transitioned = callIdToEnd?.let { transitionInternetCall(it, "ended", frame) } == true
-                if (!transitioned) sendNearbyFrame(target, frame)
+                database.omniDao().cancelPendingCall(ended.callId)
+                val frame = buildSecureFrame(
+                    OmniFrame.PAYLOAD_TYPE_CALL_END,
+                    ended.peerPublicKey,
+                    encodeCallId(ended.callId)
+                )
+                val transitioned = transitionInternetCall(
+                    ended.callId,
+                    "ended",
+                    frame,
+                    ended.peerPublicKey
+                )
+                if (!transitioned) sendNearbyFrame(ended.peerPublicKey, frame)
             }
         }
         stopRingtone()
+        incomingRingTimeoutJob?.cancel()
         cancelNotification(CALL_NOTIFICATION_ID)
         _incomingCallState.value = null
-        activePeerPublicKey = null
-        activeCallId = null
         if (!fromTelecom) telecomCallManager.disconnect()
         voiceEngine.stopCall()
         startForegroundServiceNotification(includeMicrophone = false)
+        applyResourcePolicy()
         appendChatMessage("Voice call ended")
     }
 
@@ -317,8 +478,9 @@ class OmniRelayService : Service() {
             val sentInternet = sendInternetEnvelope(frame, target, "message", null, messageId)
             val sentNearby = !sentInternet && sendNearbyFrame(target, frame)
             if (sentNearby) {
-                database.omniDao().setOutboundState(messageId, OutboundEnvelopeEntity.STATE_SENT)
-                database.omniDao().updateMessageStatus(messageId, "sent", "nearby")
+                if (database.omniDao().markOutboundSentIfPending(messageId) == 1) {
+                    database.omniDao().updateMessageStatus(messageId, "sent", "nearby")
+                }
             }
         }
         return "Queued securely for [$contactName]"
@@ -328,24 +490,96 @@ class OmniRelayService : Service() {
     fun toggleSpeaker(): Boolean = voiceEngine.toggleSpeaker(this)
 
     fun refreshConfiguration() {
-        if (settingsManager.isBleEnabled) {
-            bleMeshManager.startActiveScanning()
-            bleMeshManager.startAdvertising(
-                OmniFrame(payloadType = OmniFrame.PAYLOAD_TYPE_PRESENCE, ephemeralPublicKey = keyPair.publicKey)
-                    .packCompact()
-            )
-        } else {
-            bleMeshManager.stopActiveScanning()
-            bleMeshManager.stopAdvertising()
-        }
-        if (settingsManager.isWifiAwareEnabled) wifiAwareMeshManager.attachToNANCluster()
-        else wifiAwareMeshManager.close()
+        applyResourcePolicy()
         if (settingsManager.isRelayModeEnabled) initializeInternetRelay()
         else relayClient.closeRealtime()
         voiceEngine.updateProcessingOptions(
             settingsManager.isEchoCancellationEnabled,
             settingsManager.isNoiseSuppressionEnabled
         )
+    }
+
+    private fun applyResourcePolicy(): AdaptiveResourcePolicy.Decision {
+        val decision = AdaptiveResourcePolicy.evaluate(
+            resourceMonitor.snapshot(
+                settingsManager,
+                isForeground = appInForeground,
+                isCallActive = voiceEngine.isCallActive.value || activeCallId != null
+            )
+        )
+        val activeOwnerUse = appInForeground || voiceEngine.isCallActive.value || activeCallId != null
+        wifiAwareMeshManager.setHighBandwidthNdpAllowed(
+            decision.isHighBandwidthNearbyTransferAllowed
+        )
+        bleScanDutyJob?.cancel()
+        bleScanDutyJob = null
+        bleAdvertiseDutyJob?.cancel()
+        bleAdvertiseDutyJob = null
+        if (!settingsManager.isBleEnabled || !decision.advertiseDutyCycle.isEnabled) {
+            bleMeshManager.stopActiveScanning()
+            bleMeshManager.stopAdvertising()
+            OmniRelayBackgroundScanner.unregisterPendingIntentScanner(this)
+        } else {
+            if (activeOwnerUse && decision.scanDutyCycle.isEnabled) {
+                bleMeshManager.startActiveScanning(
+                    if (decision.isHighBandwidthNearbyTransferAllowed) {
+                        ScanSettings.SCAN_MODE_LOW_LATENCY
+                    } else {
+                        ScanSettings.SCAN_MODE_BALANCED
+                    }
+                )
+            } else if (decision.isThirdPartyRelayAllowed && decision.scanDutyCycle.isEnabled) {
+                bleMeshManager.stopActiveScanning()
+                bleScanDutyJob = serviceScope.launch {
+                    val onMillis = decision.scanDutyCycle.onDurationMillis
+                    val offMillis = decision.scanDutyCycle.periodMillis - onMillis
+                    while (true) {
+                        bleMeshManager.startActiveScanning(ScanSettings.SCAN_MODE_LOW_POWER)
+                        delay(onMillis)
+                        bleMeshManager.stopActiveScanning()
+                        if (offMillis > 0) delay(offMillis)
+                    }
+                }
+            } else {
+                bleMeshManager.stopActiveScanning()
+            }
+            val presence = OmniFrame(
+                payloadType = OmniFrame.PAYLOAD_TYPE_PRESENCE,
+                ephemeralPublicKey = keyPair.publicKey
+            ).packCompact()
+            if (activeOwnerUse) {
+                bleMeshManager.startAdvertising(
+                    presence,
+                    advertiseMode = AdvertiseSettings.ADVERTISE_MODE_BALANCED,
+                    txPowerLevel = AdvertiseSettings.ADVERTISE_TX_POWER_MEDIUM
+                )
+            } else {
+                bleMeshManager.stopAdvertising()
+                bleAdvertiseDutyJob = serviceScope.launch {
+                    val onMillis = decision.advertiseDutyCycle.onDurationMillis
+                    val offMillis = decision.advertiseDutyCycle.periodMillis - onMillis
+                    while (true) {
+                        bleMeshManager.startAdvertising(
+                            presence,
+                            advertiseMode = AdvertiseSettings.ADVERTISE_MODE_LOW_POWER,
+                            txPowerLevel = AdvertiseSettings.ADVERTISE_TX_POWER_LOW
+                        )
+                        delay(onMillis)
+                        bleMeshManager.stopAdvertising()
+                        if (offMillis > 0L) delay(offMillis)
+                    }
+                }
+            }
+            OmniRelayBackgroundScanner.registerPendingIntentScanner(this)
+        }
+        if (settingsManager.isWifiAwareEnabled && decision.scanDutyCycle.isEnabled &&
+            (activeOwnerUse || decision.isThirdPartyRelayAllowed)
+        ) {
+            wifiAwareMeshManager.attachToNANCluster()
+        } else {
+            wifiAwareMeshManager.pause()
+        }
+        return decision
     }
 
     fun setActiveConversation(secretLink: String?) {
@@ -360,25 +594,154 @@ class OmniRelayService : Service() {
     }
 
     private fun buildSecureFrame(type: Byte, targetPublicKey: ByteArray, plaintext: ByteArray): ByteArray {
-        val sharedKey = CryptoEngine.deriveSharedSecret(keyPair.privateKey, targetPublicKey)
-        val encrypted = CryptoEngine.encryptPayload(plaintext, sharedKey, byteArrayOf(type))
-        val envelope = targetPublicKey.copyOfRange(0, RECIPIENT_PREFIX_SIZE) +
-            encrypted.iv + encrypted.cipherText
-        val frame = OmniFrame(
+        val normalizedTarget = CryptoEngine.normalizePublicKey(targetPublicKey)
+        val flags = (OmniFrame.FLAG_E2EE.toInt() or if (type == OmniFrame.PAYLOAD_TYPE_VOICE) {
+            OmniFrame.FLAG_VOICE_STREAM.toInt()
+        } else {
+            OmniFrame.FLAG_RELAY_ALLOWED.toInt()
+        }).toByte()
+        val frameMetadata = OmniFrame(
             payloadType = type,
+            flags = flags,
             pathVectorMap = router.getActivePathBitmask(),
-            ephemeralPublicKey = keyPair.publicKey,
-            macTag = encrypted.macTag,
-            encryptedPayload = envelope
+            ephemeralPublicKey = keyPair.publicKey
         )
-        return frame.pack()
+        val pairSharedKey = sharedKeyWith(normalizedTarget)
+        return OmniFrameCipher.seal(
+            frameMetadata,
+            plaintext,
+            pairSharedKey,
+            keyPair.publicKey,
+            normalizedTarget
+        ).pack()
     }
+
+    private fun encodeCallId(callId: String): ByteArray {
+        val uuid = UUID.fromString(callId)
+        return ByteBuffer.allocate(16).order(ByteOrder.BIG_ENDIAN)
+            .putLong(uuid.mostSignificantBits)
+            .putLong(uuid.leastSignificantBits)
+            .array()
+    }
+
+    private fun decodeCallId(payload: ByteArray): String? = runCatching {
+        if (payload.size != 16) return null
+        val buffer = ByteBuffer.wrap(payload).order(ByteOrder.BIG_ENDIAN)
+        UUID(buffer.long, buffer.long).toString()
+    }.getOrNull()
+
+    private fun sharedKeyWith(peerPublicKey: ByteArray): ByteArray {
+        val normalized = CryptoEngine.normalizePublicKey(peerPublicKey)
+        val cacheKey = Base64.encodeToString(normalized, Base64.NO_WRAP)
+        return pairSharedKeyCache.computeIfAbsent(cacheKey) {
+            CryptoEngine.deriveSharedSecret(keyPair.privateKey, normalized)
+        }
+    }
+
+    private fun pairedPublicKeys(): List<ByteArray> = settingsManager.getPairedContacts()
+        .asSequence()
+        .take(512)
+        .mapNotNull { settingsManager.decodePublicKey(it.secretLink) }
+        .toList()
+
+    private fun routeTokenBase64(targetPublicKey: ByteArray): String {
+        val normalizedTarget = CryptoEngine.normalizePublicKey(targetPublicKey)
+        val token = CryptoEngine.deriveBackendRouteToken(
+            sharedKeyWith(normalizedTarget),
+            keyPair.publicKey,
+            normalizedTarget
+        )
+        return try {
+            Base64.encodeToString(token, Base64.NO_WRAP)
+        } finally {
+            token.fill(0)
+        }
+    }
+
+    private fun encodeVoicePayload(
+        callId: String,
+        counter: Long,
+        codec: Byte,
+        audio: ByteArray
+    ): ByteArray =
+        ByteBuffer.allocate(VOICE_HEADER_BYTES + audio.size).order(ByteOrder.BIG_ENDIAN).apply {
+            put(encodeCallId(callId))
+            putLong(counter)
+            put(codec)
+            put(audio)
+        }.array()
+
+    private fun decodeVoicePayload(payload: ByteArray): NearbyVoicePayload? = runCatching {
+        if (payload.size < VOICE_HEADER_BYTES) return null
+        val callId = decodeCallId(payload.copyOfRange(0, 16)) ?: return null
+        val buffer = ByteBuffer.wrap(payload).order(ByteOrder.BIG_ENDIAN)
+        buffer.position(16)
+        val counter = buffer.long
+        if (counter < 0) return null
+        val codec = buffer.get()
+        val audio = payload.copyOfRange(VOICE_HEADER_BYTES, payload.size)
+        val expectedBytes = when (codec) {
+            VOICE_CODEC_ADPCM -> VoiceStreamEngine.COMPRESSED_FRAME_BYTES
+            VOICE_CODEC_PCM16 -> VoiceStreamEngine.RAW_FRAME_BYTES
+            else -> return null
+        }
+        if (audio.size != expectedBytes) return null
+        NearbyVoicePayload(callId, counter, codec, audio)
+    }.getOrNull()
 
     private fun sendNearbyFrame(targetPublicKey: ByteArray, packed: ByteArray): Boolean {
         if (settingsManager.isWifiAwareEnabled && wifiAwareMeshManager.sendFrame(targetPublicKey, packed)) {
             return true
         }
-        return settingsManager.isBleEnabled && bleMeshManager.sendFrame(targetPublicKey, packed)
+        if (settingsManager.isBleEnabled && bleMeshManager.sendFrame(targetPublicKey, packed)) {
+            return true
+        }
+        if (!settingsManager.isMeshRelayEnabled) return false
+        if (packed.size > MAX_VOLUNTEER_RELAY_INNER_BYTES) return false
+        val frame = OmniFrame.unpack(packed) ?: return false
+        if (frame.payloadType == OmniFrame.PAYLOAD_TYPE_VOICE ||
+            frame.payloadType == OmniFrame.PAYLOAD_TYPE_PRESENCE ||
+            frame.flags.toInt() and OmniFrame.FLAG_RELAY_ALLOWED.toInt() == 0
+        ) return false
+        val decision = applyResourcePolicy()
+        if (!decision.scanDutyCycle.isEnabled) return false
+        val sharedKey = runCatching { sharedKeyWith(targetPublicKey) }.getOrNull() ?: return false
+        val hops = decision.maxRelayHops.coerceAtLeast(1).coerceAtMost(RelayCapsule.MAX_HOPS)
+        val capsule = RelayCapsule.seal(packed, sharedKey, hops).pack()
+        if (capsule.size > MAX_VOLUNTEER_RELAY_PACKET_BYTES) return false
+        return broadcastNearbyPacket(capsule) > 0
+    }
+
+    private fun broadcastNearbyPacket(packet: ByteArray): Int {
+        var neighbors = 0
+        if (settingsManager.isWifiAwareEnabled) neighbors += wifiAwareMeshManager.broadcastPacket(packet)
+        if (settingsManager.isBleEnabled) neighbors += bleMeshManager.broadcastPacket(packet)
+        return neighbors
+    }
+
+    private suspend fun handleNearbyPacket(packet: ByteArray, rssi: Int): Boolean {
+        if (!RelayCapsule.isCapsule(packet)) return handleReceivedFrame(packet, rssi)
+        if (packet.size > MAX_VOLUNTEER_RELAY_PACKET_BYTES ||
+            !relayPacketRate.tryAcquire(MAX_RELAY_PACKETS_PER_MINUTE)
+        ) return false
+        val capsule = RelayCapsule.unpack(packet) ?: return false
+        for (contact in settingsManager.getPairedContacts().take(512)) {
+            val publicKey = settingsManager.decodePublicKey(contact.secretLink) ?: continue
+            val sharedKey = runCatching { sharedKeyWith(publicKey) }.getOrNull() ?: continue
+            val innerFrame = capsule.tryOpen(sharedKey) ?: continue
+            if (!relayReplayTracker.markAuthenticatedDelivery(publicKey, capsule)) return true
+            return handleReceivedFrame(innerFrame, rssi)
+        }
+
+        if (!relayReplayTracker.markForwardProgress(capsule)) return true
+        val decision = applyResourcePolicy()
+        val forwarded = capsule.forwarded() ?: return false
+        val forwardedBytes = forwarded.pack()
+        val reservedBytes = forwardedBytes.size.toLong() * MAX_RELAY_FANOUT_RESERVATION
+        if (!decision.isThirdPartyRelayAllowed ||
+            !relayByteBudget.tryConsume(reservedBytes, decision.relayByteBudgetPerHour)
+        ) return false
+        return broadcastNearbyPacket(forwardedBytes) > 0
     }
 
     private fun initializeInternetRelay() {
@@ -386,13 +749,23 @@ class OmniRelayService : Service() {
         serviceScope.launch { establishInternetSession() }
     }
 
+    private suspend fun ensureInternetRegistration(fcmToken: String?) {
+        val signingIdentity = settingsManager.getMySigningIdentity()
+        try {
+            relayClient.ensureRegistered(
+                keyPair,
+                signingIdentity,
+                fcmToken,
+                pairedPublicKeys()
+            )
+        } finally {
+            signingIdentity.privateKeyDer.fill(0)
+        }
+    }
+
     private suspend fun establishInternetSession() {
         runCatching {
-            relayClient.ensureRegistered(
-                settingsManager.getMySecretLink(),
-                settingsManager.getMySigningIdentity(),
-                null
-            )
+            ensureInternetRegistration(null)
             router.updatePathTelemetry(TransportPath.CELLULAR_CONTROL, true, 100, 0f, -70)
             relayClient.connectRealtime(
                 onMailboxChanged = { serviceScope.launch { syncMailbox() } },
@@ -410,11 +783,7 @@ class OmniRelayService : Service() {
     private suspend fun updatePushToken(token: String) {
         if (!relayClient.isConfigured || !settingsManager.isRelayModeEnabled) return
         runCatching {
-            relayClient.ensureRegistered(
-                settingsManager.getMySecretLink(),
-                settingsManager.getMySigningIdentity(),
-                token
-            )
+            ensureInternetRegistration(token)
             relayClient.updatePushToken(token)
         }.onFailure {
             Log.w(TAG, "Unable to update FCM token", it)
@@ -429,9 +798,9 @@ class OmniRelayService : Service() {
         callId: String?,
         envelopeId: String = UUID.randomUUID().toString()
     ): Boolean {
-        if (!relayClient.isConfigured || !settingsManager.isRelayModeEnabled) return false
         val recipientDeviceId = CryptoEngine.deviceIdForPublicKey(targetPublicKey)
         val encodedFrame = Base64.encodeToString(packedFrame, Base64.NO_WRAP)
+        val outboundRouteToken = routeTokenBase64(targetPublicKey)
         val outbound = OutboundEnvelopeEntity(
             envelopeId = envelopeId,
             recipientDeviceId = recipientDeviceId,
@@ -441,21 +810,37 @@ class OmniRelayService : Service() {
             frameBase64 = encodedFrame
         )
         database.omniDao().insertOutbound(outbound)
+        if (kind == "call" && callId != activeCallId) {
+            callId?.let { database.omniDao().cancelPendingCall(it) }
+            return false
+        }
+        if (!relayClient.isConfigured || !settingsManager.isRelayModeEnabled) return false
         return runCatching {
-            relayClient.ensureRegistered(
-                settingsManager.getMySecretLink(),
-                settingsManager.getMySigningIdentity(),
-                null
+            ensureInternetRegistration(null)
+            if (database.omniDao().markOutboundSendingIfPending(envelopeId) != 1) return@runCatching false
+            relayClient.sendEnvelope(
+                SendEnvelopeRequest(
+                    envelopeId = envelopeId,
+                    recipientDeviceId = recipientDeviceId,
+                    kind = kind,
+                    callId = callId,
+                    frameBase64 = encodedFrame,
+                    routeTokenBase64 = outboundRouteToken
+                )
             )
-            relayClient.sendEnvelope(SendEnvelopeRequest(
-                envelopeId, recipientDeviceId, kind, callId, encodedFrame
-            ))
-            database.omniDao().setOutboundState(envelopeId, OutboundEnvelopeEntity.STATE_SENT)
-            if (kind == "message") database.omniDao().updateMessageStatus(envelopeId, "sent", "internet")
+            val committed = database.omniDao().markOutboundSentIfSending(envelopeId) == 1
+            if (kind == "message" && committed) {
+                database.omniDao().updateMessageStatus(envelopeId, "sent", "internet")
+            }
+            // The server accepted the immutable envelope even if a concurrent local cancellation
+            // won the Room compare-and-set. Never fall back and send a second copy in that case.
             true
         }.getOrElse {
             Log.w(TAG, "Internet envelope queued for retry", it)
-            database.omniDao().markOutboundRetry(envelopeId, System.currentTimeMillis() + 5_000)
+            database.omniDao().markOutboundRetryIfSending(
+                envelopeId,
+                System.currentTimeMillis() + 5_000
+            )
             scheduleRelayRetry()
             false
         }
@@ -463,37 +848,89 @@ class OmniRelayService : Service() {
 
     private suspend fun processOutbox() {
         if (!relayClient.isConfigured || !settingsManager.isRelayModeEnabled) return
-        for (outbound in database.omniDao().pendingOutbound(System.currentTimeMillis())) {
-            val success = runCatching {
-                database.omniDao().setOutboundState(outbound.envelopeId, OutboundEnvelopeEntity.STATE_SENDING)
-                relayClient.sendEnvelope(SendEnvelopeRequest(
-                    outbound.envelopeId,
-                    outbound.recipientDeviceId,
-                    outbound.kind,
-                    outbound.callId,
-                    outbound.frameBase64
-                ))
-                database.omniDao().setOutboundState(outbound.envelopeId, OutboundEnvelopeEntity.STATE_SENT)
-                if (outbound.kind == "message") {
-                    database.omniDao().updateMessageStatus(outbound.envelopeId, "sent", "internet")
+        outboxMutex.withLock {
+            val now = System.currentTimeMillis()
+            for (outbound in database.omniDao().pendingOutbound(now)) {
+                val retryableCallId = callState.snapshot()
+                    ?.takeIf { it.phase == CallStateMachine.Phase.OUTGOING_RINGING }
+                    ?.callId
+                if (!OutboundRetryPolicy.shouldAttempt(
+                        outbound.kind,
+                        outbound.callId,
+                        retryableCallId,
+                        outbound.createdAtMs,
+                        now
+                    )
+                ) {
+                    outbound.callId?.let { database.omniDao().cancelPendingCall(it) }
+                    continue
                 }
-            }.isSuccess
-            if (!success) {
-                val delay = (5_000L shl outbound.attemptCount.coerceAtMost(8)).coerceAtMost(15 * 60_000L)
-                database.omniDao().markOutboundRetry(outbound.envelopeId, System.currentTimeMillis() + delay)
+                if (database.omniDao().markOutboundSendingIfPending(outbound.envelopeId) != 1) {
+                    continue
+                }
+                val sendResult = runCatching {
+                    val recipientPublicKey = Base64.decode(
+                        outbound.recipientPublicKey,
+                        Base64.NO_WRAP
+                    )
+                    relayClient.sendEnvelope(
+                        SendEnvelopeRequest(
+                            envelopeId = outbound.envelopeId,
+                            recipientDeviceId = outbound.recipientDeviceId,
+                            kind = outbound.kind,
+                            callId = outbound.callId,
+                            frameBase64 = outbound.frameBase64,
+                            routeTokenBase64 = routeTokenBase64(recipientPublicKey)
+                        )
+                    )
+                    val committed = database.omniDao().markOutboundSentIfSending(outbound.envelopeId) == 1
+                    if (outbound.kind == "message" && committed) {
+                        database.omniDao().updateMessageStatus(outbound.envelopeId, "sent", "internet")
+                    }
+                }
+                val failure = sendResult.exceptionOrNull()
+                if (failure != null) {
+                    val terminalClientError = failure is RelayHttpException &&
+                        failure.statusCode in setOf(400, 409, 410, 413, 422)
+                    if (terminalClientError) {
+                        database.omniDao().setOutboundState(
+                            outbound.envelopeId,
+                            OutboundEnvelopeEntity.STATE_CANCELLED
+                        )
+                        if (outbound.kind == "message") {
+                            database.omniDao().updateMessageStatus(
+                                outbound.envelopeId,
+                                "failed",
+                                "internet"
+                            )
+                        }
+                        continue
+                    }
+                    val delay = (5_000L shl outbound.attemptCount.coerceAtMost(8))
+                        .coerceAtMost(15 * 60_000L)
+                    database.omniDao().markOutboundRetryIfSending(
+                        outbound.envelopeId,
+                        System.currentTimeMillis() + delay
+                    )
+                }
             }
         }
     }
 
     private suspend fun syncMailbox() {
-        if (!relayClient.isConfigured || !settingsManager.isRelayModeEnabled || relayClient.credentials() == null) return
-        runCatching {
+        mailboxSyncMutex.withLock {
+            if (!relayClient.isConfigured || !settingsManager.isRelayModeEnabled ||
+                relayClient.credentials() == null
+            ) return
+            runCatching {
             val mailbox = relayClient.fetchMailbox()
             for (status in mailbox.outboundStatuses) {
                 database.omniDao().updateMessageStatus(status.envelopeId, status.state, "internet")
             }
             for (remote in mailbox.envelopes) {
-                if (!database.omniDao().isEnvelopeProcessed(remote.envelopeId)) {
+                // Never let a remote-selected envelope ID enter persistent dedupe before the
+                // frame has parsed, matched a paired identity, and passed AEAD authentication.
+                val accepted = runCatching {
                     val frameBytes = Base64.decode(remote.frameBase64, Base64.NO_WRAP)
                     handleReceivedFrame(
                         frameBytes,
@@ -501,24 +938,35 @@ class OmniRelayService : Service() {
                         envelopeId = remote.envelopeId,
                         callId = remote.callId
                     )
-                    database.omniDao().markEnvelopeProcessed(ProcessedEnvelopeEntity(remote.envelopeId))
+                }.getOrDefault(false)
+                if (!accepted) {
+                    relayClient.acknowledge(remote.envelopeId, "rejected")
+                    continue
                 }
+                database.omniDao().markEnvelopeProcessed(ProcessedEnvelopeEntity(remote.envelopeId))
                 val receiptState = if (database.omniDao().messageStatus(remote.envelopeId) == "read") {
                     "read"
                 } else "delivered"
                 relayClient.acknowledge(remote.envelopeId, receiptState)
             }
             database.omniDao().pruneProcessed(System.currentTimeMillis() - TimeUnit.DAYS.toMillis(30))
-        }.onFailure { Log.w(TAG, "Mailbox sync failed", it) }
+            }.onFailure { Log.w(TAG, "Mailbox sync failed", it) }
+        }
     }
 
-    private suspend fun transitionInternetCall(callId: String, state: String, packedFrame: ByteArray): Boolean {
+    private suspend fun transitionInternetCall(
+        callId: String,
+        state: String,
+        packedFrame: ByteArray,
+        targetPublicKey: ByteArray
+    ): Boolean {
         if (!relayClient.isConfigured || !settingsManager.isRelayModeEnabled) return false
         return runCatching {
             relayClient.transitionCall(callId, CallStateRequest(
                 state = state,
                 envelopeId = UUID.randomUUID().toString(),
-                frameBase64 = Base64.encodeToString(packedFrame, Base64.NO_WRAP)
+                frameBase64 = Base64.encodeToString(packedFrame, Base64.NO_WRAP),
+                routeTokenBase64 = routeTokenBase64(targetPublicKey)
             ))
             true
         }.getOrElse {
@@ -527,8 +975,8 @@ class OmniRelayService : Service() {
         }
     }
 
-    private suspend fun connectInternetMedia(callId: String) {
-        val peerPublicKey = activePeerPublicKey ?: return
+    private suspend fun connectInternetMedia(callId: String, peerPublicKey: ByteArray) {
+        if (!callState.matches(callId, peerPublicKey, CallStateMachine.Phase.CONNECTING)) return
         val mediaKey = Base64.encodeToString(
             CryptoEngine.deriveCallMediaKey(keyPair.privateKey, peerPublicKey, callId),
             Base64.NO_WRAP
@@ -536,6 +984,7 @@ class OmniRelayService : Service() {
         runCatching { relayClient.callToken(callId) }
             .onSuccess { credentials ->
                 withContext(Dispatchers.Main) {
+                    if (callState.activate(callId, peerPublicKey) == null) return@withContext
                     startForegroundServiceNotification(includeMicrophone = true)
                     voiceEngine.startInternetCall(
                         this@OmniRelayService,
@@ -544,15 +993,46 @@ class OmniRelayService : Service() {
                         mediaKey,
                         onFailure = { error ->
                             Log.e(TAG, "Internet call media failed", error)
-                            appendChatMessage("Call media connection failed")
+                            failCurrentCall(callId, peerPublicKey, "Call media connection failed")
                         }
                     )
+                    startCallLease(callId, peerPublicKey)
+                    applyResourcePolicy()
                 }
             }
             .onFailure {
                 Log.e(TAG, "Unable to obtain call media token", it)
-                appendChatMessage("Call media connection failed")
+                failCurrentCall(callId, peerPublicKey, "Call media connection failed")
             }
+    }
+
+    private fun failCurrentCall(callId: String, peerPublicKey: ByteArray, message: String) {
+        val cleared = callState.terminateRemote(
+            callId,
+            peerPublicKey,
+            CallStateMachine.Phase.CONNECTING,
+            CallStateMachine.Phase.ACTIVE
+        ) ?: return
+        callLeaseJob?.cancel()
+        callLeaseJob = null
+        voiceEngine.stopCall()
+        telecomCallManager.disconnect(android.telecom.DisconnectCause.ERROR)
+        startForegroundServiceNotification(includeMicrophone = false)
+        applyResourcePolicy()
+        appendChatMessage(message)
+        serviceScope.launch { database.omniDao().cancelPendingCall(cleared.callId) }
+    }
+
+    private fun startCallLease(callId: String, peerPublicKey: ByteArray) {
+        callLeaseJob?.cancel()
+        callLeaseJob = serviceScope.launch {
+            while (callState.matches(callId, peerPublicKey, CallStateMachine.Phase.ACTIVE)) {
+                delay(CALL_LEASE_RENEW_INTERVAL_MS)
+                if (!callState.matches(callId, peerPublicKey, CallStateMachine.Phase.ACTIVE)) break
+                runCatching { relayClient.renewCallLease(callId) }
+                    .onFailure { Log.w(TAG, "Unable to renew active call lease", it) }
+            }
+        }
     }
 
     private fun scheduleRelayRetry() {
@@ -576,92 +1056,236 @@ class OmniRelayService : Service() {
     ): Boolean {
         if (frameBytes.size < OmniFrame.HEADER_SIZE) return false
         val frame = OmniFrame.unpack(frameBytes) ?: return false
+        if (frame.flags.toInt() and OmniFrame.FLAG_E2EE.toInt() == 0) return false
+        val isVoiceFrame = frame.payloadType == OmniFrame.PAYLOAD_TYPE_VOICE
+        val hasVoiceFlag = frame.flags.toInt() and OmniFrame.FLAG_VOICE_STREAM.toInt() != 0
+        if (isVoiceFrame != hasVoiceFlag) return false
         if (!settingsManager.isPairedContact(frame.ephemeralPublicKey)) return false
-        val nearbyDedupeId = if (envelopeId == null && frame.payloadType != OmniFrame.PAYLOAD_TYPE_VOICE) {
-            "nearby:" + MessageDigest.getInstance("SHA-256").digest(frameBytes)
-                .joinToString("") { "%02x".format(it) }
-        } else null
-        if (nearbyDedupeId != null && database.omniDao().isEnvelopeProcessed(nearbyDedupeId)) return false
+        if (isVoiceFrame) {
+            val encryptedVoiceHeaderBytes = OmniFrameCipher.RECIPIENT_PREFIX_BYTES +
+                CryptoEngine.IV_LENGTH_BYTES + VOICE_HEADER_BYTES
+            val validVoiceSize = frame.encryptedPayload.size ==
+                encryptedVoiceHeaderBytes + VoiceStreamEngine.COMPRESSED_FRAME_BYTES ||
+                frame.encryptedPayload.size == encryptedVoiceHeaderBytes + VoiceStreamEngine.RAW_FRAME_BYTES
+            if (!validVoiceSize ||
+                !voicePacketRate.tryAcquire(MAX_VOICE_PACKETS_PER_SECOND)
+            ) return false
+        }
 
+        // Authentication precedes persistent dedupe so a spoofed public header cannot force Room work.
         val plaintext = openSecureFrame(frame) ?: return false
+        val contentDedupeId = "frame:" + MessageDigest.getInstance("SHA-256").digest(
+            frame.ephemeralPublicKey + byteArrayOf(frame.payloadType) + frame.macTag + frame.encryptedPayload
+        ).joinToString("") { "%02x".format(it) }
+        if (isVoiceFrame) {
+            if (!markSeen(seenVoiceFrames, contentDedupeId, 8_192)) return true
+        } else if (database.omniDao().isEnvelopeProcessed(contentDedupeId)) {
+            return true
+        }
+
         val senderLink = Base64.encodeToString(frame.ephemeralPublicKey, Base64.NO_WRAP)
         val contactName = settingsManager.getContactNameForLink(senderLink)
+        val callSignalRemainingMs = when (frame.payloadType) {
+            OmniFrame.PAYLOAD_TYPE_CALL_RING,
+            OmniFrame.PAYLOAD_TYPE_CALL_ACCEPT,
+            OmniFrame.PAYLOAD_TYPE_CALL_DECLINE,
+            OmniFrame.PAYLOAD_TYPE_CALL_END -> frame.remainingLifetimeMillis(
+                CALL_SIGNAL_MAX_AGE_MS,
+                CALL_SIGNAL_MAX_FUTURE_SKEW_MS
+            ) ?: return false
+            else -> null
+        }
+        val authenticatedCallId = when (frame.payloadType) {
+            OmniFrame.PAYLOAD_TYPE_CALL_RING,
+            OmniFrame.PAYLOAD_TYPE_CALL_ACCEPT,
+            OmniFrame.PAYLOAD_TYPE_CALL_DECLINE,
+            OmniFrame.PAYLOAD_TYPE_CALL_END -> decodeCallId(plaintext) ?: return false
+            else -> null
+        }
+        if (callId != null && authenticatedCallId != null && callId != authenticatedCallId) return false
         PeerDiscoveryRegistry.updatePeer(senderLink, rssi, isMutualLinked = true)
 
         when (frame.payloadType) {
             OmniFrame.PAYLOAD_TYPE_CALL_RING -> {
-                activeCallId = callId
-                handleIncomingCallRing(contactName, senderLink)
+                val secureCallId = authenticatedCallId ?: return false
+                when (callState.receiveIncomingRing(secureCallId, frame.ephemeralPublicKey)) {
+                    CallStateMachine.RingResult.REJECTED -> return false
+                    CallStateMachine.RingResult.DUPLICATE -> Unit
+                    CallStateMachine.RingResult.NEW -> {
+                        outgoingVoiceCounter.set(0)
+                        synchronized(voiceCounterLock) { lastIncomingVoiceCounter = -1L }
+                        handleIncomingCallRing(
+                            contactName,
+                            senderLink,
+                            secureCallId,
+                            callSignalRemainingMs ?: return false
+                        )
+                    }
+                }
             }
-            OmniFrame.PAYLOAD_TYPE_CALL_ACCEPT -> handleCallAccepted(
-                contactName,
-                frame.ephemeralPublicKey,
-                if (envelopeId != null) callId else null
-            )
-            OmniFrame.PAYLOAD_TYPE_CALL_DECLINE -> handleCallDeclined(contactName)
-            OmniFrame.PAYLOAD_TYPE_CALL_END -> handleRemoteCallEnded(contactName)
-            OmniFrame.PAYLOAD_TYPE_TEXT -> handleIncomingTextMsg(contactName, senderLink, plaintext, envelopeId)
-            OmniFrame.PAYLOAD_TYPE_VOICE -> if (voiceEngine.isCallActive.value) {
-                voiceEngine.receiveIncomingVoiceBurst(plaintext)
+            OmniFrame.PAYLOAD_TYPE_CALL_ACCEPT -> {
+                val secureCallId = authenticatedCallId ?: return false
+                val accepted = callState.acceptRemote(secureCallId, frame.ephemeralPublicKey)
+                    ?: return false
+                incomingRingTimeoutJob?.cancel()
+                handleCallAccepted(
+                    contactName,
+                    accepted,
+                    useInternetMedia = envelopeId != null
+                )
             }
+            OmniFrame.PAYLOAD_TYPE_CALL_DECLINE -> {
+                val secureCallId = authenticatedCallId ?: return false
+                val declined = callState.terminateRemote(
+                    secureCallId,
+                    frame.ephemeralPublicKey,
+                    CallStateMachine.Phase.OUTGOING_RINGING
+                ) ?: return false
+                handleCallDeclined(contactName, declined)
+            }
+            OmniFrame.PAYLOAD_TYPE_CALL_END -> {
+                val secureCallId = authenticatedCallId ?: return false
+                val ended = callState.terminateRemote(secureCallId, frame.ephemeralPublicKey)
+                    ?: return false
+                handleRemoteCallEnded(contactName, ended)
+            }
+            OmniFrame.PAYLOAD_TYPE_TEXT -> {
+                if (plaintext.size > MAX_TEXT_BYTES) return false
+                handleIncomingTextMsg(
+                    contactName,
+                    senderLink,
+                    plaintext,
+                    envelopeId,
+                    contentDedupeId
+                )
+            }
+            OmniFrame.PAYLOAD_TYPE_VOICE -> {
+                val voice = decodeVoicePayload(plaintext) ?: return false
+                val currentCall = callState.snapshot() ?: return false
+                if (currentCall.phase != CallStateMachine.Phase.ACTIVE ||
+                    currentCall.callId != voice.callId ||
+                    !currentCall.peerPublicKey.contentEquals(frame.ephemeralPublicKey)
+                ) return false
+                val valid = synchronized(voiceCounterLock) {
+                    val counterDelta = if (lastIncomingVoiceCounter < 0L) {
+                        voice.counter + 1L
+                    } else {
+                        voice.counter - lastIncomingVoiceCounter
+                    }
+                    if (!voiceEngine.isCallActive.value ||
+                        counterDelta !in 1L..MAX_VOICE_COUNTER_JUMP ||
+                        !callState.matches(
+                            voice.callId,
+                            frame.ephemeralPublicKey,
+                            CallStateMachine.Phase.ACTIVE
+                        )
+                    ) return@synchronized false
+                    lastIncomingVoiceCounter = voice.counter
+                    true
+                }
+                if (!valid) return false
+                voiceEngine.receiveIncomingVoiceBurst(
+                    voice.audio,
+                    isPcm = voice.codec == VOICE_CODEC_PCM16
+                )
+            }
+            else -> return false
         }
-        if (nearbyDedupeId != null) {
-            database.omniDao().markEnvelopeProcessed(ProcessedEnvelopeEntity(nearbyDedupeId))
+        if (frame.payloadType != OmniFrame.PAYLOAD_TYPE_VOICE &&
+            frame.payloadType != OmniFrame.PAYLOAD_TYPE_TEXT
+        ) {
+            database.omniDao().markEnvelopeProcessed(ProcessedEnvelopeEntity(contentDedupeId))
         }
         return true
     }
 
+    private fun markSeen(cache: LinkedHashMap<String, Unit>, id: String, maxEntries: Int): Boolean =
+        synchronized(cache) {
+            if (cache.containsKey(id)) return@synchronized false
+            cache[id] = Unit
+            while (cache.size > maxEntries) cache.entries.iterator().run {
+                if (hasNext()) {
+                    next()
+                    remove()
+                }
+            }
+            true
+        }
+
     private fun openSecureFrame(frame: OmniFrame): ByteArray? {
-        val minimumSize = RECIPIENT_PREFIX_SIZE + CryptoEngine.IV_LENGTH_BYTES
-        if (frame.encryptedPayload.size < minimumSize) return null
-        val recipientPrefix = frame.encryptedPayload.copyOfRange(0, RECIPIENT_PREFIX_SIZE)
-        if (!recipientPrefix.contentEquals(keyPair.publicKey.copyOfRange(0, RECIPIENT_PREFIX_SIZE))) return null
-        val ivStart = RECIPIENT_PREFIX_SIZE
-        val cipherStart = ivStart + CryptoEngine.IV_LENGTH_BYTES
-        val encrypted = CryptoEngine.EncryptedResult(
-            cipherText = frame.encryptedPayload.copyOfRange(cipherStart, frame.encryptedPayload.size),
-            iv = frame.encryptedPayload.copyOfRange(ivStart, cipherStart),
-            macTag = frame.macTag
-        )
-        val sharedKey = runCatching {
-            CryptoEngine.deriveSharedSecret(keyPair.privateKey, frame.ephemeralPublicKey)
-        }.getOrNull() ?: return null
-        return CryptoEngine.decryptPayload(encrypted, sharedKey, byteArrayOf(frame.payloadType))
+        val pairSharedKey = runCatching { sharedKeyWith(frame.ephemeralPublicKey) }.getOrNull() ?: return null
+        return OmniFrameCipher.open(frame, pairSharedKey, keyPair.publicKey)
     }
 
-    private fun handleIncomingCallRing(callerName: String, callerPublicKey: String) {
-        if (_incomingCallState.value != null || voiceEngine.isCallActive.value) return
-        val platformCallId = activeCallId ?: UUID.randomUUID().toString().also { activeCallId = it }
+    private fun handleIncomingCallRing(
+        callerName: String,
+        callerPublicKey: String,
+        callId: String,
+        remainingRingMillis: Long
+    ) {
+        val current = callState.snapshot()
+        if (current?.callId != callId || current.phase != CallStateMachine.Phase.INCOMING_RINGING) {
+            return
+        }
         _incomingCallState.value = CallInvite(callerName, callerPublicKey)
-        telecomCallManager.reportIncoming(callerName, platformCallId)
+        telecomCallManager.reportIncoming(callerName, callId)
         playRingtone()
         postIncomingCallNotification(callerName)
         appendChatMessage("Incoming E2EE call from [$callerName]")
+        incomingRingTimeoutJob?.cancel()
+        incomingRingTimeoutJob = serviceScope.launch {
+            delay(remainingRingMillis.coerceAtMost(OUTGOING_RING_TIMEOUT_MS))
+            val expired = callState.expire(callId, CallStateMachine.Phase.INCOMING_RINGING)
+            if (expired != null) {
+                _incomingCallState.value = null
+                stopRingtone()
+                cancelNotification(CALL_NOTIFICATION_ID)
+                telecomCallManager.disconnect(android.telecom.DisconnectCause.MISSED)
+                applyResourcePolicy()
+                appendChatMessage("Missed encrypted call from [$callerName]")
+            }
+        }
     }
 
-    private fun handleCallAccepted(contactName: String, senderPublicKey: ByteArray, internetCallId: String?) {
-        activePeerPublicKey = senderPublicKey.copyOf()
-        activeCallId = internetCallId ?: activeCallId
+    private fun handleCallAccepted(
+        contactName: String,
+        call: CallStateMachine.Session,
+        useInternetMedia: Boolean
+    ) {
+        incomingRingTimeoutJob?.cancel()
+        serviceScope.launch { database.omniDao().cancelPendingCall(call.callId) }
         telecomCallManager.setActive()
-        if (internetCallId != null) serviceScope.launch { connectInternetMedia(internetCallId) }
-        else startVoiceMedia()
+        if (useInternetMedia) {
+            serviceScope.launch { connectInternetMedia(call.callId, call.peerPublicKey) }
+        } else {
+            startVoiceMedia(call.callId, call.peerPublicKey)
+        }
         appendChatMessage("Call accepted by [$contactName]")
     }
 
-    private fun handleCallDeclined(contactName: String) {
-        activePeerPublicKey = null
-        activeCallId = null
+    private fun handleCallDeclined(contactName: String, call: CallStateMachine.Session) {
+        incomingRingTimeoutJob?.cancel()
+        callLeaseJob?.cancel()
+        callLeaseJob = null
         voiceEngine.stopCall()
+        serviceScope.launch { database.omniDao().cancelPendingCall(call.callId) }
         telecomCallManager.disconnect(android.telecom.DisconnectCause.REJECTED)
+        applyResourcePolicy()
         appendChatMessage("Call declined by [$contactName]")
     }
 
-    private fun handleRemoteCallEnded(contactName: String) {
-        activePeerPublicKey = null
-        activeCallId = null
+    private fun handleRemoteCallEnded(contactName: String, call: CallStateMachine.Session) {
+        incomingRingTimeoutJob?.cancel()
+        callLeaseJob?.cancel()
+        callLeaseJob = null
+        stopRingtone()
+        cancelNotification(CALL_NOTIFICATION_ID)
+        _incomingCallState.value = null
         voiceEngine.stopCall()
+        serviceScope.launch { database.omniDao().cancelPendingCall(call.callId) }
         telecomCallManager.disconnect(android.telecom.DisconnectCause.REMOTE)
         startForegroundServiceNotification(includeMicrophone = false)
+        applyResourcePolicy()
         appendChatMessage("Call ended by [$contactName]")
     }
 
@@ -669,22 +1293,28 @@ class OmniRelayService : Service() {
         senderName: String,
         senderLink: String,
         plaintext: ByteArray,
-        envelopeId: String?
+        envelopeId: String?,
+        contentDedupeId: String
     ) {
         val text = plaintext.toString(Charsets.UTF_8)
         val isOpenConversation = envelopeId != null && activeConversationLink == senderLink
-        database.omniDao().insertMessage(MessageEntity(
-            envelopeId ?: UUID.randomUUID().toString(), senderLink, senderName, messageProtector.encrypt(text),
-            "incoming", if (isOpenConversation) "read" else "delivered",
-            if (envelopeId == null) "nearby" else "internet", System.currentTimeMillis()
-        ))
-        postIncomingMessageNotification(senderName, text)
+        val inserted = database.omniDao().insertIncomingMessageOnce(
+            MessageEntity(
+                envelopeId ?: UUID.randomUUID().toString(), senderLink, senderName, messageProtector.encrypt(text),
+                "incoming", if (isOpenConversation) "read" else "delivered",
+                if (envelopeId == null) "nearby" else "internet", System.currentTimeMillis()
+            ),
+            ProcessedEnvelopeEntity(contentDedupeId)
+        )
+        if (inserted) postIncomingMessageNotification(senderName, text)
     }
 
-    private fun startVoiceMedia() {
+    private fun startVoiceMedia(callId: String, peerPublicKey: ByteArray) {
+        if (callState.activate(callId, peerPublicKey) == null) return
         startForegroundServiceNotification(includeMicrophone = true)
         voiceEngine.startCall()
         telecomCallManager.setActive()
+        applyResourcePolicy()
     }
 
     private fun appendChatMessage(message: String) {
@@ -694,13 +1324,42 @@ class OmniRelayService : Service() {
     override fun onBind(intent: Intent?): IBinder = binder
 
     override fun onDestroy() {
+        callState.terminateLocal()
+        callLeaseJob?.cancel()
+        callLeaseJob = null
         stopRingtone()
-        bleMeshManager.close()
-        wifiAwareMeshManager.close()
-        relayClient.closeRealtime()
+        incomingRingTimeoutJob?.cancel()
+        if (::bleMeshManager.isInitialized) bleMeshManager.close()
+        if (::wifiAwareMeshManager.isInitialized) wifiAwareMeshManager.close()
+        if (::relayClient.isInitialized) relayClient.closeRealtime()
+        pairSharedKeyCache.values.forEach { it.fill(0) }
+        pairSharedKeyCache.clear()
+        if (::keyPair.isInitialized) keyPair.privateKey.fill(0)
         serviceScope.cancel()
-        voiceEngine.stopCall()
+        if (::voiceEngine.isInitialized) voiceEngine.stopCall()
+        if (::settingsManager.isInitialized) settingsManager.close()
         super.onDestroy()
+    }
+
+    private fun postIdentityRecoveryNotification() {
+        val openApp = PendingIntent.getActivity(
+            this,
+            IDENTITY_NOTIFICATION_ID,
+            Intent(this, MainActivity::class.java),
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+        )
+        val notification = NotificationCompat.Builder(this, MSG_CHANNEL_ID)
+            .setSmallIcon(android.R.drawable.stat_sys_warning)
+            .setContentTitle("OmniRelay identity locked")
+            .setContentText("Open OmniRelay for recovery guidance. Networking was stopped safely.")
+            .setContentIntent(openApp)
+            .setAutoCancel(true)
+            .setVisibility(NotificationCompat.VISIBILITY_PRIVATE)
+            .build()
+        runCatching {
+            (getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager)
+                .notify(IDENTITY_NOTIFICATION_ID, notification)
+        }.onFailure { Log.w(TAG, "Unable to show identity recovery notification", it) }
     }
 
     private fun createNotificationChannels() {

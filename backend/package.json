@@ -13,8 +13,8 @@
     "build": "tsc -p tsconfig.json",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "start": "node dist/src/server.js",
-    "test": "tsx --test test/**/*.test.ts",
-    "test:unit": "tsx --test test/identity.test.ts test/protocol.test.ts",
+    "test": "tsx --test --test-concurrency=1 test/**/*.test.ts",
+    "test:unit": "tsx --test --test-concurrency=1 test/bounded-task-queue.test.ts test/config.test.ts test/hub.test.ts test/identity.test.ts test/protocol.test.ts test/repository-validation.test.ts test/route-authorization.test.ts test/server-reliability.test.ts",
     "test:integration": "tsx --test test/relay.integration.test.ts",
     "audit": "pnpm audit --prod --audit-level=high"
   },

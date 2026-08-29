@@ -1,6 +1,6 @@
 # Setup and deployment
 
-This guide covers local two-phone testing, self-hosted production deployment,
+This guide covers local two/three-phone testing, self-hosted production deployment,
 Android release configuration, and automated checks.
 
 [Back to README](../README.md) · [Architecture](PRODUCTION_ARCHITECTURE.md) ·
@@ -15,7 +15,8 @@ Android release configuration, and automated checks.
 - Node.js 24 and the pnpm version pinned in `backend/package.json` for backend
   development and tests outside Docker
 - Two physical Android 8.0+ phones for end-to-end tests; nearby mode depends on
-  each device's BLE/Wi-Fi Aware support
+  each device's BLE/Wi-Fi Aware support. Use three phones to validate volunteer
+  opportunistic forwarding behavior.
 
 Run commands from the repository root unless a section says otherwise. Replace
 all `YOUR_...` values and example domains with your own configuration.
@@ -95,16 +96,36 @@ to `app/build/outputs/apk/debug/app-debug.apk` and is intentionally excluded
 from Git.
 
 1. Install the APK on both phones and connect them to the reachable LAN.
-2. Grant the requested notification, microphone, and nearby-device permissions.
+2. Invoke each feature and grant its notification, microphone, Bluetooth, or
+   Wi-Fi permission when requested. OmniRelay deliberately does not request all
+   permissions at first launch; denial should disable only the affected feature.
 3. Copy each phone's Secret Link from Settings and add it as a contact on the
-   other phone. Both phones must add each other.
+   other phone. Both phones must add each other. While online, each phone then
+   synchronizes its hashed inbound route authorizations; an identity that was
+   merely registered cannot send to the mailbox.
 4. Test messaging, delivery states, incoming calls, and two-way audio.
 5. Test nearby transport separately with internet disabled, then work through
    the remaining [device-validation checklist](RELEASE_CHECKLIST.md#device-validation).
 
+For a three-phone relay test, opt the middle phone into **Volunteer nearby
+relay**, select BALANCED or GENEROUS, and keep sender and receiver outside direct
+radio reach while each can simultaneously reach the middle phone. Test text and call signaling;
+live audio is intentionally not carried by a third-party phone. The volunteer
+setting is off by default and remains disabled in MINIMAL mode. The current
+volunteer path does not persist capsules after the immediate forwarding attempt.
+
+On API 29+, Wi-Fi Aware can establish an on-demand pair-authenticated NDP socket;
+API 26–28 uses encrypted follow-up fallback. An established NDP carries lossless
+16 kHz PCM voice, while BLE uses ADPCM. Do not make production throughput or
+battery claims until the physical-device NDP release gate passes.
+
 The default backend URL is `https://relay.example.invalid`. CI APKs built with
 that default are build artifacts, not configured internet-test clients. Build
 with your reachable backend URL before testing relay delivery.
+
+Wire protocol v2 deliberately rejects vulnerable v1 frames. Upgrade both phones
+and the backend together. Stale v1 outbox records fail terminally instead of
+retrying or downgrading; clear pre-release test history when starting a clean run.
 
 ## Production deployment
 
@@ -160,6 +181,22 @@ local health does not prove public TLS, FCM, TURN, or two-way audio works.
 
 Set up encrypted database backups, a tested restore procedure, uptime and disk
 monitoring, and credential recovery before accepting production traffic.
+
+### Low-cost host profile
+
+The generated configuration starts conservatively: four PostgreSQL pool
+connections, 64 admitted HTTP requests, 768 TCP connections, 512 WebSockets,
+four active plus 256 queued FCM jobs, 100 pending envelopes per sender/recipient
+pair, four outstanding registration challenges per identity, a 120-second active
+call lease, finite query/request timeouts, and 500-row cleanup batches every 15 minutes.
+These controls protect a small server from unlimited queues; they are not a
+universal capacity estimate.
+
+Keep the defaults for initial private testing. Measure CPU, memory, database
+connections, p95 request latency, mailbox growth, and LiveKit/TURN bandwidth
+before raising any limit. Audio media—not encrypted text—is normally the main
+bandwidth cost, especially when TURN relays it. Scale media and signaling
+separately when usage grows.
 
 ## Android release configuration
 

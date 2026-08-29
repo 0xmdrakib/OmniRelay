@@ -11,6 +11,7 @@ import android.os.IBinder
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.core.content.ContextCompat
 import androidx.compose.animation.*
 import androidx.compose.animation.core.*
 import androidx.compose.foundation.Canvas
@@ -44,11 +45,17 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.example.omnirelay.data.local.MessageEntity
+import com.example.omnirelay.permissions.PermissionCapabilityPlanner
+import com.example.omnirelay.permissions.PermissionCapabilityPlanner.CapabilityPlan
+import com.example.omnirelay.permissions.PermissionCapabilityPlanner.PermissionRequestGroup
+import com.example.omnirelay.permissions.PermissionCapabilityPlanner.PermissionStage
+import com.example.omnirelay.permissions.PermissionCapabilityPlanner.RuntimePermission
 import com.example.omnirelay.radio.PeerDiscoveryRegistry
 import com.example.omnirelay.radio.PeerNode
 import com.example.omnirelay.service.CallInvite
 import com.example.omnirelay.service.OmniRelayService
 import com.example.omnirelay.theme.OmniRelayTheme
+import com.example.omnirelay.routing.AdaptiveResourcePolicy.UserResourceTier
 import com.example.omnirelay.utils.PairedContact
 import com.example.omnirelay.utils.SettingsManager
 import java.util.Locale
@@ -57,12 +64,17 @@ class MainActivity : ComponentActivity() {
 
     private var omniService: OmniRelayService? by mutableStateOf(null)
     private var isBound by mutableStateOf(false)
+    private var activityStarted = false
+    private var permissionRevision by mutableIntStateOf(0)
+    private var pendingPermissionRationale by mutableStateOf<PermissionRequestGroup?>(null)
+    private var identityStartupError by mutableStateOf<String?>(null)
 
     private val serviceConnection = object : ServiceConnection {
         override fun onServiceConnected(name: ComponentName?, service: IBinder?) {
             val binder = service as OmniRelayService.LocalBinder
             omniService = binder.getService()
             isBound = true
+            omniService?.setAppInForeground(activityStarted)
         }
 
         override fun onServiceDisconnected(name: ComponentName?) {
@@ -74,50 +86,136 @@ class MainActivity : ComponentActivity() {
     private val requestPermissionLauncher = registerForActivityResult(
         ActivityResultContracts.RequestMultiplePermissions()
     ) {
-        startAndBindService()
+        permissionRevision++
+        omniService?.refreshConfiguration()
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        requestRequiredPermissions()
+        identityStartupError = runCatching {
+            SettingsManager(this, observeExternalChanges = false).use { settings ->
+                settings.getMyIdentity().privateKey.fill(0)
+                settings.getMySigningIdentity().privateKeyDer.fill(0)
+            }
+        }.exceptionOrNull()?.let {
+            "Your encrypted device identity could not be unlocked. OmniRelay preserved it and " +
+                "did not create a replacement identity. Restore the device/Keystore state or " +
+                "explicitly reset app data only after confirming recovery options."
+        }
+        if (identityStartupError == null) startAndBindService()
 
         setContent {
+            val revision = permissionRevision
+            val permissionPlan = remember(revision) { currentPermissionPlan() }
             OmniRelayTheme {
                 Surface(
                     modifier = Modifier.fillMaxSize(),
                     color = Color(0xFFF3F2F8)
                 ) {
-                    MinimalAppDashboard(omniService = omniService)
+                    val startupError = identityStartupError
+                    if (startupError != null) {
+                        IdentityUnavailableScreen(startupError)
+                    } else {
+                        MinimalAppDashboard(
+                            omniService = omniService,
+                            permissionPlan = permissionPlan,
+                            onRequestPermission = ::showPermissionRationale
+                        )
+                    }
                 }
+            }
+            pendingPermissionRationale?.let { group ->
+                AlertDialog(
+                    onDismissRequest = { pendingPermissionRationale = null },
+                    title = { Text(group.title) },
+                    text = { Text(group.rationale) },
+                    confirmButton = {
+                        TextButton(onClick = {
+                            pendingPermissionRationale = null
+                            requestPermissionLauncher.launch(
+                                group.permissions.mapNotNull(::manifestPermission).toTypedArray()
+                            )
+                        }) { Text("CONTINUE") }
+                    },
+                    dismissButton = {
+                        TextButton(onClick = { pendingPermissionRationale = null }) {
+                            Text("NOT NOW")
+                        }
+                    }
+                )
             }
         }
     }
 
-    private fun requestRequiredPermissions() {
-        val permissions = mutableListOf(
-            Manifest.permission.ACCESS_FINE_LOCATION,
-            Manifest.permission.RECORD_AUDIO,
-            Manifest.permission.MODIFY_AUDIO_SETTINGS
+    override fun onStart() {
+        super.onStart()
+        activityStarted = true
+        omniService?.setAppInForeground(true)
+    }
+
+    override fun onResume() {
+        super.onResume()
+        permissionRevision++
+    }
+
+    override fun onStop() {
+        omniService?.setAppInForeground(false)
+        activityStarted = false
+        super.onStop()
+    }
+
+    private fun currentPermissionPlan(): CapabilityPlan = PermissionCapabilityPlanner.plan(
+        apiLevel = Build.VERSION.SDK_INT,
+        granted = PermissionCapabilityPlanner.GrantedPermissions(
+            microphone = isGranted(Manifest.permission.RECORD_AUDIO),
+            notifications = Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU ||
+                isGranted(Manifest.permission.POST_NOTIFICATIONS),
+            bluetoothScan = Build.VERSION.SDK_INT < Build.VERSION_CODES.S ||
+                isGranted(Manifest.permission.BLUETOOTH_SCAN),
+            bluetoothAdvertise = Build.VERSION.SDK_INT < Build.VERSION_CODES.S ||
+                isGranted(Manifest.permission.BLUETOOTH_ADVERTISE),
+            bluetoothConnect = Build.VERSION.SDK_INT < Build.VERSION_CODES.S ||
+                isGranted(Manifest.permission.BLUETOOTH_CONNECT),
+            nearbyWifiDevices = Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU ||
+                isGranted(Manifest.permission.NEARBY_WIFI_DEVICES),
+            coarseLocation = isGranted(Manifest.permission.ACCESS_COARSE_LOCATION),
+            fineLocation = isGranted(Manifest.permission.ACCESS_FINE_LOCATION)
         )
+    )
 
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-            permissions.add(Manifest.permission.BLUETOOTH_SCAN)
-            permissions.add(Manifest.permission.BLUETOOTH_ADVERTISE)
-            permissions.add(Manifest.permission.BLUETOOTH_CONNECT)
-        }
+    private fun isGranted(permission: String): Boolean =
+        ContextCompat.checkSelfPermission(this, permission) == android.content.pm.PackageManager.PERMISSION_GRANTED
 
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-            permissions.add(Manifest.permission.POST_NOTIFICATIONS)
-            permissions.add(Manifest.permission.NEARBY_WIFI_DEVICES)
-        }
+    private fun showPermissionRationale(stage: PermissionStage) {
+        pendingPermissionRationale = currentPermissionPlan().permissionGroups
+            .firstOrNull { it.stage == stage }
+    }
 
-        requestPermissionLauncher.launch(permissions.toTypedArray())
+    private fun manifestPermission(permission: RuntimePermission): String? = when (permission) {
+        RuntimePermission.MICROPHONE -> Manifest.permission.RECORD_AUDIO
+        RuntimePermission.NOTIFICATIONS -> if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            Manifest.permission.POST_NOTIFICATIONS
+        } else null
+        RuntimePermission.BLUETOOTH_SCAN -> if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            Manifest.permission.BLUETOOTH_SCAN
+        } else null
+        RuntimePermission.BLUETOOTH_ADVERTISE -> if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            Manifest.permission.BLUETOOTH_ADVERTISE
+        } else null
+        RuntimePermission.BLUETOOTH_CONNECT -> if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            Manifest.permission.BLUETOOTH_CONNECT
+        } else null
+        RuntimePermission.NEARBY_WIFI_DEVICES -> if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            Manifest.permission.NEARBY_WIFI_DEVICES
+        } else null
+        RuntimePermission.COARSE_LOCATION -> Manifest.permission.ACCESS_COARSE_LOCATION
+        RuntimePermission.FINE_LOCATION -> Manifest.permission.ACCESS_FINE_LOCATION
     }
 
     private fun startAndBindService() {
         val intent = Intent(this, OmniRelayService::class.java)
-        startForegroundService(intent)
-        bindService(intent, serviceConnection, Context.BIND_AUTO_CREATE)
+        runCatching { ContextCompat.startForegroundService(this, intent) }
+        if (!isBound) bindService(intent, serviceConnection, Context.BIND_AUTO_CREATE)
     }
 
     override fun onDestroy() {
@@ -133,11 +231,36 @@ class MainActivity : ComponentActivity() {
 // LUXURY SOFT PASTEL GLASS UI DASHBOARD
 // ==========================================
 @Composable
-fun MinimalAppDashboard(omniService: OmniRelayService?) {
+fun IdentityUnavailableScreen(message: String) {
+    Box(modifier = Modifier.fillMaxSize().padding(24.dp), contentAlignment = Alignment.Center) {
+        Card(
+            shape = RoundedCornerShape(24.dp),
+            colors = CardDefaults.cardColors(containerColor = Color.White)
+        ) {
+            Column(modifier = Modifier.padding(24.dp), horizontalAlignment = Alignment.CenterHorizontally) {
+                Icon(Icons.Default.Lock, contentDescription = null, tint = Color(0xFFFF7675))
+                Spacer(Modifier.height(12.dp))
+                Text("Identity safely locked", fontWeight = FontWeight.Black, fontSize = 18.sp)
+                Spacer(Modifier.height(8.dp))
+                Text(message, color = Color(0xFF7E7E9A), fontSize = 13.sp)
+            }
+        }
+    }
+}
+
+@Composable
+fun MinimalAppDashboard(
+    omniService: OmniRelayService?,
+    permissionPlan: CapabilityPlan,
+    onRequestPermission: (PermissionStage) -> Unit
+) {
     val context = androidx.compose.ui.platform.LocalContext.current
     var selectedTab by remember { mutableIntStateOf(0) }
 
     val settingsManager = remember { SettingsManager(context) }
+    DisposableEffect(settingsManager) {
+        onDispose { settingsManager.close() }
+    }
 
     val serviceCallActive by (omniService?.isCallActive?.collectAsState(initial = false) ?: remember { mutableStateOf(false) })
     val isMuted by (omniService?.isMuted?.collectAsState(initial = false) ?: remember { mutableStateOf(false) })
@@ -222,7 +345,7 @@ fun MinimalAppDashboard(omniService: OmniRelayService?) {
                             letterSpacing = 0.3.sp
                         )
                         Text(
-                            text = "Zero-Data E2EE Mesh Stream",
+                            text = "Private Hybrid E2EE",
                             color = Color(0xFF7E7E9A),
                             fontSize = 11.sp,
                             fontWeight = FontWeight.Medium
@@ -285,7 +408,13 @@ fun MinimalAppDashboard(omniService: OmniRelayService?) {
                         Spacer(modifier = Modifier.height(16.dp))
                         Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
                             Button(
-                                onClick = { omniService?.acceptIncomingCall() },
+                                onClick = {
+                                    if (permissionPlan.capabilities.voiceCalling) {
+                                        omniService?.acceptIncomingCall()
+                                    } else {
+                                        onRequestPermission(PermissionStage.START_OR_ANSWER_VOICE_CALL)
+                                    }
+                                },
                                 modifier = Modifier.weight(1f).height(48.dp),
                                 colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF00B894)),
                                 shape = RoundedCornerShape(14.dp)
@@ -322,7 +451,14 @@ fun MinimalAppDashboard(omniService: OmniRelayService?) {
                             omniService?.setActiveConversation(contact?.secretLink)
                         },
                         onSendMessage = { text, targetLink -> omniService?.dispatchMessage(text, targetLink) },
-                        onStartCall = { targetLink -> omniService?.initiateCall(targetLink); selectedTab = 1 },
+                        onStartCall = { targetLink ->
+                            if (permissionPlan.capabilities.voiceCalling) {
+                                omniService?.initiateCall(targetLink)
+                                selectedTab = 1
+                            } else {
+                                onRequestPermission(PermissionStage.START_OR_ANSWER_VOICE_CALL)
+                            }
+                        },
                         onNavigateToSettings = { selectedTab = 2 }
                     )
                     1 -> CallsScreen(
@@ -333,7 +469,13 @@ fun MinimalAppDashboard(omniService: OmniRelayService?) {
                         isMuted = isMuted,
                         isSpeakerOn = isSpeakerOn,
                         callDurationSec = callDurationSec,
-                        onStartCall = { targetLink -> omniService?.initiateCall(targetLink) },
+                        onStartCall = { targetLink ->
+                            if (permissionPlan.capabilities.voiceCalling) {
+                                omniService?.initiateCall(targetLink)
+                            } else {
+                                onRequestPermission(PermissionStage.START_OR_ANSWER_VOICE_CALL)
+                            }
+                        },
                         onEndCall = { omniService?.stopVoiceCall() },
                         onToggleMute = { omniService?.toggleMute() },
                         onToggleSpeaker = { omniService?.toggleSpeaker() },
@@ -341,6 +483,8 @@ fun MinimalAppDashboard(omniService: OmniRelayService?) {
                     )
                     2 -> SettingsScreen(
                         settingsManager = settingsManager,
+                        permissionPlan = permissionPlan,
+                        onRequestPermission = onRequestPermission,
                         onSettingsUpdated = {
                             refreshTrigger++
                             omniService?.refreshConfiguration()
@@ -586,7 +730,7 @@ fun PairedChatsScreen(
                     OutlinedTextField(
                         value = messageText,
                         onValueChange = { messageText = it },
-                        placeholder = { Text("Type zero-data message...", color = Color(0xFF9E9EB8), fontSize = 14.sp) },
+                        placeholder = { Text("Type an encrypted message...", color = Color(0xFF9E9EB8), fontSize = 14.sp) },
                         modifier = Modifier.weight(1f),
                         colors = OutlinedTextFieldDefaults.colors(
                             focusedBorderColor = Color.Transparent,
@@ -668,7 +812,7 @@ fun PairedChatsScreen(
                             Text("No Mutual Contacts Paired", fontWeight = FontWeight.Bold, color = Color(0xFF1E1C2E), fontSize = 16.sp)
                             Spacer(modifier = Modifier.height(6.dp))
                             Text(
-                                text = "Exchange Secret Links in Settings to start messaging and calling zero-data offline.",
+                                text = "Exchange Secret Links in Settings. Delivery uses the internet relay when available or nearby peer-to-peer radio.",
                                 color = Color(0xFF7E7E9A),
                                 fontSize = 12.sp,
                                 textAlign = androidx.compose.ui.text.style.TextAlign.Center
@@ -793,7 +937,7 @@ fun CallsScreen(
                                 color = Color(0xFF6C5CE7).copy(alpha = 0.3f)
                             ) {
                                 Text(
-                                    text = "32 kbps ADPCM HD VOICE",
+                                    text = "E2EE ADAPTIVE VOICE",
                                     fontSize = 10.sp,
                                     fontWeight = FontWeight.Bold,
                                     color = Color(0xFFB4A7FA),
@@ -994,6 +1138,8 @@ fun CallsScreen(
 @Composable
 fun SettingsScreen(
     settingsManager: SettingsManager,
+    permissionPlan: CapabilityPlan,
+    onRequestPermission: (PermissionStage) -> Unit,
     onSettingsUpdated: () -> Unit
 ) {
     val context = androidx.compose.ui.platform.LocalContext.current
@@ -1006,6 +1152,8 @@ fun SettingsScreen(
     var bleChecked by remember { mutableStateOf(settingsManager.isBleEnabled) }
     var wifiChecked by remember { mutableStateOf(settingsManager.isWifiAwareEnabled) }
     var relayChecked by remember { mutableStateOf(settingsManager.isRelayModeEnabled) }
+    var meshRelayChecked by remember { mutableStateOf(settingsManager.isMeshRelayEnabled) }
+    var resourceTier by remember { mutableStateOf(settingsManager.resourceTier) }
 
     var noiseSuppressionChecked by remember { mutableStateOf(settingsManager.isNoiseSuppressionEnabled) }
     var echoCancellationChecked by remember { mutableStateOf(settingsManager.isEchoCancellationEnabled) }
@@ -1016,6 +1164,41 @@ fun SettingsScreen(
             .padding(horizontal = 20.dp),
         verticalArrangement = Arrangement.spacedBy(16.dp)
     ) {
+        if (permissionPlan.permissionGroups.isNotEmpty()) {
+            item {
+                Text(
+                    text = "FEATURE PERMISSIONS",
+                    fontWeight = FontWeight.Bold,
+                    color = Color(0xFF7E7E9A),
+                    fontSize = 12.sp,
+                    letterSpacing = 1.sp
+                )
+            }
+            items(permissionPlan.permissionGroups, key = { it.stage.name }) { group ->
+                Card(
+                    modifier = Modifier.fillMaxWidth(),
+                    shape = RoundedCornerShape(20.dp),
+                    colors = CardDefaults.cardColors(containerColor = Color.White)
+                ) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth().padding(16.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.SpaceBetween
+                    ) {
+                        Column(modifier = Modifier.weight(1f)) {
+                            Text(group.title, fontWeight = FontWeight.Bold, color = Color(0xFF1E1C2E), fontSize = 14.sp)
+                            Spacer(Modifier.height(4.dp))
+                            Text(group.rationale, color = Color(0xFF7E7E9A), fontSize = 11.sp, maxLines = 3)
+                        }
+                        Spacer(Modifier.width(12.dp))
+                        TextButton(onClick = { onRequestPermission(group.stage) }) {
+                            Text("ENABLE", fontWeight = FontWeight.Bold)
+                        }
+                    }
+                }
+            }
+        }
+
         // Section: Identity & Secret Link
         item {
             Text(
@@ -1213,14 +1396,21 @@ fun SettingsScreen(
                 Column(modifier = Modifier.padding(20.dp)) {
                     Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
                         Column(modifier = Modifier.weight(1f)) {
-                            Text("Bluetooth LE 5.3 PAwR", color = Color(0xFF1E1C2E), fontWeight = FontWeight.Bold, fontSize = 14.sp)
-                            Text("Low energy background mesh discovery", color = Color(0xFF7E7E9A), fontSize = 11.sp)
+                            Text("Bluetooth LE + GATT", color = Color(0xFF1E1C2E), fontWeight = FontWeight.Bold, fontSize = 14.sp)
+                            Text("Filtered low-power discovery and encrypted data", color = Color(0xFF7E7E9A), fontSize = 11.sp)
                         }
                         Switch(
                             checked = bleChecked,
                             onCheckedChange = {
                                 bleChecked = it
                                 settingsManager.isBleEnabled = it
+                                if (it && !permissionPlan.capabilities.bluetoothRelay) {
+                                    permissionPlan.permissionGroups.firstOrNull { group ->
+                                        group.stage == PermissionStage.ENABLE_BLUETOOTH_NEARBY ||
+                                            group.stage == PermissionStage.ENABLE_LEGACY_BLUETOOTH_DISCOVERY ||
+                                            group.stage == PermissionStage.ENABLE_LEGACY_NEARBY_DISCOVERY
+                                    }?.let { group -> onRequestPermission(group.stage) }
+                                }
                                 onSettingsUpdated()
                             },
                             colors = SwitchDefaults.colors(checkedThumbColor = Color.White, checkedTrackColor = Color(0xFF6C5CE7))
@@ -1231,13 +1421,19 @@ fun SettingsScreen(
                     Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
                         Column(modifier = Modifier.weight(1f)) {
                             Text("Wi-Fi Aware (NAN)", color = Color(0xFF1E1C2E), fontWeight = FontWeight.Bold, fontSize = 14.sp)
-                            Text("High bandwidth P2P cluster routing", color = Color(0xFF7E7E9A), fontSize = 11.sp)
+                            Text("Nearby discovery and encrypted signaling", color = Color(0xFF7E7E9A), fontSize = 11.sp)
                         }
                         Switch(
                             checked = wifiChecked,
                             onCheckedChange = {
                                 wifiChecked = it
                                 settingsManager.isWifiAwareEnabled = it
+                                if (it && !permissionPlan.capabilities.wifiAware) {
+                                    permissionPlan.permissionGroups.firstOrNull { group ->
+                                        group.stage == PermissionStage.ENABLE_WIFI_AWARE ||
+                                            group.stage == PermissionStage.ENABLE_LEGACY_NEARBY_DISCOVERY
+                                    }?.let { group -> onRequestPermission(group.stage) }
+                                }
                                 onSettingsUpdated()
                             },
                             colors = SwitchDefaults.colors(checkedThumbColor = Color.White, checkedTrackColor = Color(0xFF6C5CE7))
@@ -1259,6 +1455,43 @@ fun SettingsScreen(
                             },
                             colors = SwitchDefaults.colors(checkedThumbColor = Color.White, checkedTrackColor = Color(0xFF6C5CE7))
                         )
+                    }
+                    HorizontalDivider(modifier = Modifier.padding(vertical = 12.dp), color = Color(0xFFF3F2F8))
+
+                    Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
+                        Column(modifier = Modifier.weight(1f)) {
+                            Text("Private Multi-Hop Volunteer", color = Color(0xFF1E1C2E), fontWeight = FontWeight.Bold, fontSize = 14.sp)
+                            Text("Opt in to forward padded opaque capsules; voice is never relayed", color = Color(0xFF7E7E9A), fontSize = 11.sp)
+                        }
+                        Switch(
+                            checked = meshRelayChecked,
+                            onCheckedChange = {
+                                meshRelayChecked = it
+                                settingsManager.isMeshRelayEnabled = it
+                                if (it && resourceTier == UserResourceTier.MINIMAL) {
+                                    resourceTier = UserResourceTier.BALANCED
+                                    settingsManager.resourceTier = resourceTier
+                                }
+                                onSettingsUpdated()
+                            },
+                            colors = SwitchDefaults.colors(checkedThumbColor = Color.White, checkedTrackColor = Color(0xFF6C5CE7))
+                        )
+                    }
+                    HorizontalDivider(modifier = Modifier.padding(vertical = 12.dp), color = Color(0xFFF3F2F8))
+
+                    Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
+                        Column(modifier = Modifier.weight(1f)) {
+                            Text("Resource Profile", color = Color(0xFF1E1C2E), fontWeight = FontWeight.Bold, fontSize = 14.sp)
+                            Text("Controls battery, heat, data budget, and maximum relay hops", color = Color(0xFF7E7E9A), fontSize = 11.sp)
+                        }
+                        TextButton(onClick = {
+                            val tiers = UserResourceTier.entries
+                            resourceTier = tiers[(resourceTier.ordinal + 1) % tiers.size]
+                            settingsManager.resourceTier = resourceTier
+                            onSettingsUpdated()
+                        }) {
+                            Text(resourceTier.name, fontWeight = FontWeight.Bold, fontSize = 11.sp)
+                        }
                     }
                 }
             }

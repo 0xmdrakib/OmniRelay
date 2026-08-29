@@ -19,9 +19,12 @@ class SecureTokenStore(context: Context) {
         private const val KEY_ALIAS = "omnirelay_relay_credentials_v1"
         private const val KEY_DEVICE_ID = "relay_device_id"
         private const val KEY_TOKEN_CIPHER = "relay_token_cipher"
+        private const val KEY_REGISTRATION_VERSION = "relay_registration_version"
+        private const val CURRENT_REGISTRATION_VERSION = 2
     }
 
     fun load(): RelayCredentials? {
+        if (prefs.getInt(KEY_REGISTRATION_VERSION, 0) != CURRENT_REGISTRATION_VERSION) return null
         val deviceId = prefs.getString(KEY_DEVICE_ID, null) ?: return null
         val encoded = prefs.getString(KEY_TOKEN_CIPHER, null) ?: return null
         return runCatching {
@@ -40,11 +43,16 @@ class SecureTokenStore(context: Context) {
         prefs.edit()
             .putString(KEY_DEVICE_ID, credentials.deviceId)
             .putString(KEY_TOKEN_CIPHER, Base64.encodeToString(encrypted, Base64.NO_WRAP))
+            .putInt(KEY_REGISTRATION_VERSION, CURRENT_REGISTRATION_VERSION)
             .apply()
     }
 
     fun clear() {
-        prefs.edit().remove(KEY_DEVICE_ID).remove(KEY_TOKEN_CIPHER).apply()
+        prefs.edit()
+            .remove(KEY_DEVICE_ID)
+            .remove(KEY_TOKEN_CIPHER)
+            .remove(KEY_REGISTRATION_VERSION)
+            .apply()
     }
 
     private fun getOrCreateKey(): SecretKey {

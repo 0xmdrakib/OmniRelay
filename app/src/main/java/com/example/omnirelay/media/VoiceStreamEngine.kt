@@ -15,7 +15,7 @@ import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
-import java.util.concurrent.ConcurrentLinkedQueue
+import java.util.concurrent.ArrayBlockingQueue
 
 /**
  * VoiceStreamEngine: Low-bitrate 16kHz speech capture, IMA-ADPCM frame compression,
@@ -35,6 +35,8 @@ class VoiceStreamEngine(
         const val FRAME_SIZE_SAMPLES = 320 // 20ms frame at 16kHz
         const val BYTES_PER_SAMPLE = 2
         const val RAW_FRAME_BYTES = FRAME_SIZE_SAMPLES * BYTES_PER_SAMPLE // 640 bytes
+        const val COMPRESSED_FRAME_BYTES = RAW_FRAME_BYTES / 4
+        private const val MAX_JITTER_FRAMES = 50
     }
 
     private var audioRecord: AudioRecord? = null
@@ -46,7 +48,9 @@ class VoiceStreamEngine(
     private var timerJob: Job? = null
     private var liveKitRoom: Room? = null
 
-    private val jitterBuffer = ConcurrentLinkedQueue<ByteArray>()
+    private data class IncomingVoiceFrame(val isPcm: Boolean, val bytes: ByteArray)
+
+    private val jitterBuffer = ArrayBlockingQueue<IncomingVoiceFrame>(MAX_JITTER_FRAMES)
     private val scope = CoroutineScope(Dispatchers.Default + SupervisorJob())
 
     private val _isCallActive = MutableStateFlow(false)
@@ -61,7 +65,7 @@ class VoiceStreamEngine(
     private val _callDurationSeconds = MutableStateFlow(0)
     val callDurationSeconds: StateFlow<Int> = _callDurationSeconds.asStateFlow()
 
-    var onVoiceBurstGenerated: ((ByteArray) -> Unit)? = null
+    var onVoiceBurstGenerated: ((adpcm: ByteArray, pcm: ByteArray) -> Unit)? = null
 
     fun updateProcessingOptions(echoCancellation: Boolean, noiseSuppression: Boolean) {
         enableEchoCancellation = echoCancellation
@@ -140,7 +144,7 @@ class VoiceStreamEngine(
                 if (readBytes > 0 && !_isMuted.value) {
                     if (readBytes < RAW_FRAME_BYTES) buffer.fill(0, readBytes, RAW_FRAME_BYTES)
                     val compressedBurst = AdpcmCodec.encode(buffer)
-                    onVoiceBurstGenerated?.invoke(compressedBurst)
+                    onVoiceBurstGenerated?.invoke(compressedBurst, buffer.copyOf())
                 } else {
                     delay(20)
                 }
@@ -159,10 +163,12 @@ class VoiceStreamEngine(
             }
 
             while (isActive && _isCallActive.value) {
-                val burst = jitterBuffer.poll()
-                if (burst != null) {
-                    val pcmFrame = try {
-                        AdpcmCodec.decode(burst)
+                val incoming = jitterBuffer.poll()
+                if (incoming != null) {
+                    val pcmFrame = if (incoming.isPcm) {
+                        incoming.bytes
+                    } else try {
+                        AdpcmCodec.decode(incoming.bytes)
                     } catch (e: Exception) {
                         ByteArray(RAW_FRAME_BYTES)
                     }
@@ -252,8 +258,14 @@ class VoiceStreamEngine(
         Log.i(TAG, "Voice Call stopped.")
     }
 
-    fun receiveIncomingVoiceBurst(burst: ByteArray) {
-        jitterBuffer.offer(burst)
+    fun receiveIncomingVoiceBurst(burst: ByteArray, isPcm: Boolean = false) {
+        val expectedBytes = if (isPcm) RAW_FRAME_BYTES else COMPRESSED_FRAME_BYTES
+        if (burst.size != expectedBytes) return
+        val safeFrame = IncomingVoiceFrame(isPcm, burst.copyOf())
+        if (!jitterBuffer.offer(safeFrame)) {
+            jitterBuffer.poll()
+            jitterBuffer.offer(safeFrame)
+        }
     }
 
     @SuppressLint("MissingPermission")

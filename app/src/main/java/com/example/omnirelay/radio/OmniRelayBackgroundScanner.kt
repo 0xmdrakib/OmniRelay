@@ -9,7 +9,10 @@ import android.content.Context
 import android.content.Intent
 import android.os.Build
 import android.util.Log
+import com.example.omnirelay.protocol.OmniFrame
+import com.example.omnirelay.routing.AdaptiveResourcePolicy.UserResourceTier
 import com.example.omnirelay.service.OmniRelayService
+import com.example.omnirelay.utils.SettingsManager
 
 /**
  * OmniRelayBackgroundScanner: Hardware PendingIntent-driven BLE Scan Receiver.
@@ -21,6 +24,9 @@ class OmniRelayBackgroundScanner : BroadcastReceiver() {
         const val TAG = "BackgroundScanner"
         const val ACTION_BLE_SCAN_RESULT = "com.example.omnirelay.ACTION_BLE_SCAN_RESULT"
         const val REQUEST_CODE = 0x401
+        private const val WAKE_DEBOUNCE_MS = 15_000L
+        private const val WAKE_PREFS = "OmniRelayBackgroundWake"
+        private const val KEY_LAST_WAKE_MS = "last_wake_ms"
 
         @SuppressLint("MissingPermission")
         fun registerPendingIntentScanner(context: Context) {
@@ -31,7 +37,7 @@ class OmniRelayBackgroundScanner : BroadcastReceiver() {
             val filter = ScanFilter.Builder()
                 .setManufacturerData(
                     BleMeshManager.MANUFACTURER_ID,
-                    byteArrayOf(0x10),
+                    byteArrayOf(0x20),
                     byteArrayOf(0xF0.toByte())
                 )
                 .build()
@@ -43,23 +49,32 @@ class OmniRelayBackgroundScanner : BroadcastReceiver() {
                 .setNumOfMatches(ScanSettings.MATCH_NUM_MAX_ADVERTISEMENT)
                 .build()
 
+            try {
+                scanner.startScan(listOf(filter), settings, scannerPendingIntent(context))
+                Log.i(TAG, "Hardware PendingIntent BLE Scanner registered successfully.")
+            } catch (e: Exception) {
+                Log.e(TAG, "Failed to register PendingIntent BLE scanner", e)
+            }
+        }
+
+        @SuppressLint("MissingPermission")
+        fun unregisterPendingIntentScanner(context: Context) {
+            val scanner = (context.getSystemService(Context.BLUETOOTH_SERVICE) as? BluetoothManager)
+                ?.adapter?.bluetoothLeScanner ?: return
+            runCatching { scanner.stopScan(scannerPendingIntent(context)) }
+                .onFailure { Log.w(TAG, "Unable to unregister background BLE scanner", it) }
+        }
+
+        private fun scannerPendingIntent(context: Context): PendingIntent {
             val intent = Intent(context, OmniRelayBackgroundScanner::class.java).apply {
                 action = ACTION_BLE_SCAN_RESULT
             }
-
-            val pendingIntent = PendingIntent.getBroadcast(
+            return PendingIntent.getBroadcast(
                 context,
                 REQUEST_CODE,
                 intent,
                 PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_MUTABLE
             )
-
-            try {
-                scanner.startScan(listOf(filter), settings, pendingIntent)
-                Log.i(TAG, "Hardware PendingIntent BLE Scanner registered successfully.")
-            } catch (e: Exception) {
-                Log.e(TAG, "Failed to register PendingIntent BLE scanner", e)
-            }
         }
     }
 
@@ -75,10 +90,21 @@ class OmniRelayBackgroundScanner : BroadcastReceiver() {
                 intent.getParcelableArrayListExtra(BluetoothLeScanner.EXTRA_LIST_SCAN_RESULT)
             }
 
+            val settings = SettingsManager(context.applicationContext, observeExternalChanges = false)
             results?.forEach { scanResult ->
                 val presence = scanResult.scanRecord
                     ?.getManufacturerSpecificData(BleMeshManager.MANUFACTURER_ID)
-                if (presence != null) {
+                val frame = presence?.let(OmniFrame::unpack) ?: return@forEach
+                val prefix = frame.ephemeralPublicKey.copyOf(OmniFrame.COMPACT_KEY_PREFIX_SIZE)
+                val isPaired = settings.getPairedContactForPrefix(prefix) != null
+                val volunteerWakeAllowed = settings.isMeshRelayEnabled &&
+                    settings.resourceTier != UserResourceTier.MINIMAL
+                if (isPaired || volunteerWakeAllowed) {
+                    val wakePrefs = context.getSharedPreferences(WAKE_PREFS, Context.MODE_PRIVATE)
+                    val now = System.currentTimeMillis()
+                    val lastWake = wakePrefs.getLong(KEY_LAST_WAKE_MS, 0L)
+                    if (now < lastWake || now - lastWake < WAKE_DEBOUNCE_MS) return@forEach
+                    wakePrefs.edit().putLong(KEY_LAST_WAKE_MS, now).apply()
                     Log.d(TAG, "OmniRelay peer discovered in background; RSSI=${scanResult.rssi}")
                     val serviceIntent = Intent(context, OmniRelayService::class.java)
                     runCatching { context.startForegroundService(serviceIntent) }

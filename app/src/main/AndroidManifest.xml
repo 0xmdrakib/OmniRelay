@@ -21,7 +21,7 @@
         tools:targetApi="tiramisu" />
 
     <!-- Location (Required for legacy BLE/Wi-Fi scanning) -->
-    <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" android:maxSdkVersion="30" />
+    <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" android:maxSdkVersion="32" />
     <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION" android:maxSdkVersion="30" />
 
     <!-- Audio Recording for Real-Time Voice Calls -->

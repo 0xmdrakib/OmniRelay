@@ -11,11 +11,23 @@ CREATE TABLE IF NOT EXISTS devices (
 );
 
 CREATE TABLE IF NOT EXISTS registration_challenges (
-  device_id TEXT PRIMARY KEY,
+  challenge_id UUID PRIMARY KEY,
+  device_id TEXT NOT NULL,
   public_key_base64 TEXT NOT NULL,
   signing_public_key_base64 TEXT NOT NULL,
   nonce_base64 TEXT NOT NULL,
+  x25519_proof_base64 TEXT,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
   expires_at TIMESTAMPTZ NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS inbound_routes (
+  recipient_id TEXT NOT NULL REFERENCES devices(device_id) ON DELETE CASCADE,
+  sender_id TEXT NOT NULL CHECK (sender_id ~ '^[0-9a-f]{64}$'),
+  route_token_hash BYTEA NOT NULL CHECK (octet_length(route_token_hash) = 32),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  PRIMARY KEY (recipient_id, sender_id),
+  CHECK (recipient_id <> sender_id)
 );
 
 CREATE TABLE IF NOT EXISTS call_sessions (
@@ -38,14 +50,63 @@ CREATE TABLE IF NOT EXISTS envelopes (
   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
   expires_at TIMESTAMPTZ NOT NULL,
   delivered_at TIMESTAMPTZ,
-  read_at TIMESTAMPTZ
+  read_at TIMESTAMPTZ,
+  rejected_at TIMESTAMPTZ
 );
+
+ALTER TABLE envelopes ADD COLUMN IF NOT EXISTS rejected_at TIMESTAMPTZ;
+ALTER TABLE registration_challenges ADD COLUMN IF NOT EXISTS x25519_proof_base64 TEXT;
+ALTER TABLE registration_challenges ADD COLUMN IF NOT EXISTS challenge_id UUID;
+ALTER TABLE registration_challenges ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ NOT NULL DEFAULT NOW();
+UPDATE registration_challenges SET challenge_id = gen_random_uuid() WHERE challenge_id IS NULL;
+ALTER TABLE registration_challenges ALTER COLUMN challenge_id SET NOT NULL;
+
+DO $migration$
+DECLARE
+  legacy_primary_key TEXT;
+BEGIN
+  SELECT constraint_record.conname INTO legacy_primary_key
+  FROM pg_constraint AS constraint_record
+  WHERE constraint_record.conrelid = 'registration_challenges'::regclass
+    AND constraint_record.contype = 'p'
+    AND (
+      SELECT array_agg(attribute_record.attname ORDER BY key_column.ordinality)
+      FROM unnest(constraint_record.conkey) WITH ORDINALITY AS key_column(attnum, ordinality)
+      JOIN pg_attribute AS attribute_record
+        ON attribute_record.attrelid = constraint_record.conrelid
+       AND attribute_record.attnum = key_column.attnum
+    ) = ARRAY['device_id']::name[];
+  IF legacy_primary_key IS NOT NULL THEN
+    EXECUTE format('ALTER TABLE registration_challenges DROP CONSTRAINT %I', legacy_primary_key);
+    ALTER TABLE registration_challenges
+      ADD CONSTRAINT registration_challenges_pkey PRIMARY KEY (challenge_id);
+  END IF;
+END
+$migration$;
 
 CREATE INDEX IF NOT EXISTS envelopes_mailbox_idx
   ON envelopes(recipient_id, created_at) WHERE delivered_at IS NULL;
+CREATE INDEX IF NOT EXISTS envelopes_pair_pending_idx
+  ON envelopes(recipient_id, sender_id, created_at) WHERE delivered_at IS NULL;
+CREATE INDEX IF NOT EXISTS envelopes_outbound_status_idx
+  ON envelopes(sender_id, created_at DESC) WHERE delivered_at IS NOT NULL;
+CREATE INDEX IF NOT EXISTS envelopes_call_idx
+  ON envelopes(call_id) WHERE call_id IS NOT NULL;
 CREATE INDEX IF NOT EXISTS envelopes_expiry_idx ON envelopes(expires_at);
+CREATE INDEX IF NOT EXISTS envelopes_read_cleanup_idx ON envelopes(read_at)
+  WHERE read_at IS NOT NULL;
+CREATE INDEX IF NOT EXISTS envelopes_rejected_cleanup_idx ON envelopes(rejected_at)
+  WHERE rejected_at IS NOT NULL;
 CREATE INDEX IF NOT EXISTS call_sessions_participants_idx
   ON call_sessions(caller_id, callee_id, updated_at DESC);
+CREATE INDEX IF NOT EXISTS call_sessions_expiry_idx ON call_sessions(expires_at);
+UPDATE call_sessions
+SET expires_at = NOW() + INTERVAL '120 seconds', updated_at = NOW()
+WHERE state = 'active' AND expires_at > NOW() + INTERVAL '120 seconds';
+CREATE INDEX IF NOT EXISTS registration_challenges_expiry_idx
+  ON registration_challenges(expires_at);
+CREATE INDEX IF NOT EXISTS registration_challenges_device_idx
+  ON registration_challenges(device_id, created_at);
 
 ALTER TABLE devices ADD COLUMN IF NOT EXISTS token_expires_at TIMESTAMPTZ;
 UPDATE devices SET token_expires_at = NOW() + INTERVAL '30 days' WHERE token_expires_at IS NULL;

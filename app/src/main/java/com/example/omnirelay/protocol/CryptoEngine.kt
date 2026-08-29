@@ -31,6 +31,10 @@ object CryptoEngine {
     private val x25519PublicDerPrefix = hex("302a300506032b656e032100")
     private val x25519PrivateDerPrefix = hex("302e020100300506032b656e04220420")
     private val hkdfInfo = "OmniRelay/X25519/AES-256-GCM/v1".toByteArray(Charsets.UTF_8)
+    private val omniFrameContentLabel =
+        "OmniRelay/OmniFrame/content-key/v2\u0000".toByteArray(Charsets.UTF_8)
+    private val backendRouteLabel =
+        "OmniRelay/Backend-Route/v1\u0000".toByteArray(Charsets.UTF_8)
 
     data class KeyPairData(
         val publicKey: ByteArray,
@@ -70,6 +74,29 @@ object CryptoEngine {
         }
     }
 
+    fun verifyEd25519(publicKeyDer: ByteArray, message: ByteArray, signature: ByteArray): Boolean =
+        runCatching {
+            val key = KeyFactory.getInstance("Ed25519").generatePublic(X509EncodedKeySpec(publicKeyDer))
+            Signature.getInstance("Ed25519").run {
+                initVerify(key)
+                update(message)
+                verify(signature)
+            }
+        }.getOrDefault(false)
+
+    fun isValidX25519KeyPair(pair: KeyPairData): Boolean = runCatching {
+        val probe = generateX25519KeyPair()
+        MessageDigest.isEqual(
+            deriveSharedSecret(pair.privateKey, probe.publicKey),
+            deriveSharedSecret(probe.privateKey, pair.publicKey)
+        )
+    }.getOrDefault(false)
+
+    fun isValidEd25519KeyPair(pair: SigningKeyPairData): Boolean = runCatching {
+        val challenge = ByteArray(32).also(random::nextBytes)
+        verifyEd25519(pair.publicKeyDer, challenge, signEd25519(pair.privateKeyDer, challenge))
+    }.getOrDefault(false)
+
     /** Converts either raw or standard DER-encoded X25519 keys to 32 raw bytes. */
     fun normalizePublicKey(key: ByteArray): ByteArray = normalizeRawKey(key, x25519PublicDerPrefix)
 
@@ -105,6 +132,64 @@ object CryptoEngine {
         mac.init(SecretKeySpec(sharedSecret, "HmacSHA256"))
         mac.update("OmniRelay/LiveKit-E2EE/v1\n".toByteArray(Charsets.UTF_8))
         return mac.doFinal(callId.toByteArray(Charsets.UTF_8))
+    }
+
+    /** Derives a direction-specific content key so A→B ciphertext cannot authenticate as B→A. */
+    fun deriveOmniFrameContentKey(
+        pairSharedSecret: ByteArray,
+        senderPublicKey: ByteArray,
+        recipientPublicKey: ByteArray
+    ): ByteArray {
+        require(pairSharedSecret.size >= X25519_KEY_SIZE) { "Pair secret must be 32 bytes" }
+        val sender = normalizePublicKey(senderPublicKey)
+        val recipient = normalizePublicKey(recipientPublicKey)
+        require(!MessageDigest.isEqual(sender, recipient)) { "Sender and recipient must be distinct" }
+        val mac = Mac.getInstance("HmacSHA256")
+        mac.init(SecretKeySpec(pairSharedSecret.copyOf(X25519_KEY_SIZE), "HmacSHA256"))
+        mac.update(omniFrameContentLabel)
+        mac.update(sender)
+        mac.update(recipient)
+        return mac.doFinal()
+    }
+
+    /** Recipient-issued capability used only to admit this sender→recipient route at the backend. */
+    fun deriveBackendRouteToken(
+        pairSharedSecret: ByteArray,
+        senderPublicKey: ByteArray,
+        recipientPublicKey: ByteArray
+    ): ByteArray {
+        require(pairSharedSecret.size >= X25519_KEY_SIZE) { "Pair secret must be 32 bytes" }
+        val sender = normalizePublicKey(senderPublicKey)
+        val recipient = normalizePublicKey(recipientPublicKey)
+        require(!MessageDigest.isEqual(sender, recipient)) { "Sender and recipient must be distinct" }
+        val mac = Mac.getInstance("HmacSHA256")
+        mac.init(SecretKeySpec(pairSharedSecret.copyOf(X25519_KEY_SIZE), "HmacSHA256"))
+        mac.update(backendRouteLabel)
+        mac.update(sender)
+        mac.update(recipient)
+        return mac.doFinal()
+    }
+
+    /** Proves possession of the Secret Link's X25519 private key during relay registration. */
+    fun registrationX25519Proof(
+        localPrivateKey: ByteArray,
+        serverEphemeralPublicKey: ByteArray,
+        deviceId: String,
+        nonceBase64: String,
+        signingPublicKeyBase64: String
+    ): ByteArray {
+        require(deviceId.matches(Regex("[0-9a-f]{64}"))) { "Invalid relay device ID" }
+        require(nonceBase64.isNotBlank() && signingPublicKeyBase64.isNotBlank())
+        val pairSharedSecret = deriveSharedSecret(localPrivateKey, serverEphemeralPublicKey)
+        val mac = Mac.getInstance("HmacSHA256")
+        mac.init(SecretKeySpec(pairSharedSecret, "HmacSHA256"))
+        mac.update("OmniRelay/Register-X25519/v2\u0000".toByteArray(Charsets.UTF_8))
+        mac.update(deviceId.toByteArray(Charsets.UTF_8))
+        mac.update(0)
+        mac.update(nonceBase64.toByteArray(Charsets.UTF_8))
+        mac.update(0)
+        mac.update(signingPublicKeyBase64.toByteArray(Charsets.UTF_8))
+        return mac.doFinal()
     }
 
     fun encryptPayload(

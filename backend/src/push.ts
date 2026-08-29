@@ -2,6 +2,7 @@ import { cert, getApps, initializeApp } from "firebase-admin/app";
 import { getMessaging } from "firebase-admin/messaging";
 
 export interface PushGateway {
+  readonly enabled: boolean;
   sendWake(token: string, envelopeId: string, kind: "message" | "call"): Promise<void>;
 }
 
@@ -13,12 +14,16 @@ export class InvalidPushTokenError extends Error {
 }
 
 class DisabledPushGateway implements PushGateway {
+  readonly enabled = false;
+
   async sendWake(): Promise<void> {
     // WebSocket and mailbox polling remain fully functional without Firebase.
   }
 }
 
 class FirebasePushGateway implements PushGateway {
+  readonly enabled = true;
+
   constructor(serviceAccountJson: string) {
     if (getApps().length === 0) {
       const serviceAccount = JSON.parse(serviceAccountJson);

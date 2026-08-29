@@ -3,7 +3,8 @@ package com.example.omnirelay.media
 /**
  * AdpcmCodec: High-Intelligibility IMA-ADPCM (4-bit per sample) Audio Codec.
  * Encodes 16-bit PCM mono audio into 4-bit nibbles (4:1 compression ratio).
- * Converts 640-byte 16kHz PCM audio frames into 160-byte ADPCM frames with 100% speech clarity.
+ * Converts 640-byte 16 kHz PCM frames into 160-byte ADPCM frames. This is a lossy,
+ * speech-oriented 32 kbps fallback for constrained nearby links.
  */
 object AdpcmCodec {
 

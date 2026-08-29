@@ -11,6 +11,9 @@ object NearbyFrameFragmentCodec {
     private const val MAGIC_TWO: Byte = 0x52
     private const val HEADER_BYTES = 10
     private const val MAX_FRAGMENTS = 8_192
+    private const val MAX_ASSEMBLED_BYTES = 128 * 1024
+    private const val MAX_ACTIVE_ASSEMBLIES = 32
+    private const val MAX_ACTIVE_ASSEMBLIES_PER_PEER = 4
     private const val ASSEMBLY_TTL_MS = 30_000L
     private val random = SecureRandom()
 
@@ -37,13 +40,16 @@ object NearbyFrameFragmentCodec {
 
     class Assembler {
         private data class Assembly(
+            val peerId: String,
             val parts: Array<ByteArray?>,
             val createdAtMs: Long = System.currentTimeMillis()
         )
 
         private val assemblies = ConcurrentHashMap<String, Assembly>()
 
+        @Synchronized
         fun accept(peerId: String, packet: ByteArray): ByteArray? {
+            if (packet.isEmpty() || packet.size > MAX_ASSEMBLED_BYTES) return null
             if (!isFragment(packet)) return packet.copyOf()
             val buffer = ByteBuffer.wrap(packet).order(ByteOrder.BIG_ENDIAN)
             buffer.position(2)
@@ -53,18 +59,39 @@ object NearbyFrameFragmentCodec {
             if (total !in 1..MAX_FRAGMENTS || index >= total || !buffer.hasRemaining()) return null
             prune()
             val key = "$peerId:$transferId"
+            if (!assemblies.containsKey(key) &&
+                assemblies.values.count { it.peerId == peerId } >= MAX_ACTIVE_ASSEMBLIES_PER_PEER
+            ) {
+                assemblies.entries
+                    .filter { it.value.peerId == peerId }
+                    .minByOrNull { it.value.createdAtMs }
+                    ?.let { oldest -> assemblies.remove(oldest.key, oldest.value) }
+            }
+            if (!assemblies.containsKey(key) && assemblies.size >= MAX_ACTIVE_ASSEMBLIES) {
+                assemblies.entries.minByOrNull { it.value.createdAtMs }?.let { oldest ->
+                    assemblies.remove(oldest.key, oldest.value)
+                }
+            }
             val assembly = assemblies.compute(key) { _, existing ->
-                if (existing == null || existing.parts.size != total) Assembly(arrayOfNulls(total)) else existing
+                if (existing == null || existing.parts.size != total) {
+                    Assembly(peerId, arrayOfNulls(total))
+                } else existing
             } ?: return null
-            assembly.parts[index] = ByteArray(buffer.remaining()).also(buffer::get)
-            if (assembly.parts.any { it == null }) return null
-            assemblies.remove(key)
-            val size = assembly.parts.sumOf { it!!.size }
-            return ByteArray(size).also { output ->
-                var offset = 0
-                for (part in assembly.parts) {
-                    part!!.copyInto(output, offset)
-                    offset += part.size
+            return synchronized(assembly) {
+                assembly.parts[index] = ByteArray(buffer.remaining()).also(buffer::get)
+                val receivedBytes = assembly.parts.sumOf { it?.size ?: 0 }
+                if (receivedBytes > MAX_ASSEMBLED_BYTES) {
+                    assemblies.remove(key, assembly)
+                    return@synchronized null
+                }
+                if (assembly.parts.any { it == null }) return@synchronized null
+                assemblies.remove(key, assembly)
+                ByteArray(receivedBytes).also { output ->
+                    var offset = 0
+                    for (part in assembly.parts) {
+                        part!!.copyInto(output, offset)
+                        offset += part.size
+                    }
                 }
             }
         }

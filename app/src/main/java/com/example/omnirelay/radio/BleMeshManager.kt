@@ -24,6 +24,7 @@ import android.content.Context
 import android.os.Build
 import android.util.Log
 import com.example.omnirelay.protocol.OmniFrame
+import com.example.omnirelay.protocol.RelayCapsule
 import java.util.ArrayDeque
 import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
@@ -41,7 +42,17 @@ class BleMeshManager(private val context: Context) {
         const val MANUFACTURER_ID = 0x0A11
         private const val DESIRED_MTU = 517
         private const val DEFAULT_ATT_PAYLOAD = 20
-        private const val MAX_PENDING_FRAMES = 128
+        private const val MAX_GATT_FRAME_BYTES = 20 * 1024
+        private const val MAX_PENDING_FRAMES = 32
+        private const val MAX_PENDING_BYTES = 256 * 1024
+        private const val MAX_DISCOVERED_PEERS = 64
+        private const val MAX_CLIENT_SESSIONS = 8
+        private const val MAX_BROADCAST_NEIGHBORS = 8
+        private const val PEER_EXPIRY_MS = 2 * 60_000L
+        private const val MAX_INGRESS_PACKETS_PER_SECOND = 2_048
+        private const val MAX_INGRESS_BYTES_PER_SECOND = 256 * 1024
+        private const val MAX_PEER_INGRESS_PACKETS_PER_SECOND = 128
+        private const val MAX_PEER_INGRESS_BYTES_PER_SECOND = 32 * 1024
         val OMNI_SERVICE_UUID: UUID = UUID.fromString("9E10A001-4B52-4F1E-8B31-0192A0F81234")
         val OMNI_CHAR_UUID: UUID = UUID.fromString("9E10A002-4B52-4F1E-8B31-0192A0F81234")
     }
@@ -55,10 +66,17 @@ class BleMeshManager(private val context: Context) {
     private class ClientSession(
         val gatt: BluetoothGatt,
         val pendingFrames: ArrayDeque<ByteArray> = ArrayDeque(),
+        val activeFragments: ArrayDeque<ByteArray> = ArrayDeque(),
+        var pendingBytes: Int = 0,
         var ready: Boolean = false,
         var writeInFlight: Boolean = false,
         var mtuPayloadBytes: Int = DEFAULT_ATT_PAYLOAD
     )
+
+    private class PeerIngressBudget {
+        val packets = FixedWindowPermitBudget(MAX_PEER_INGRESS_PACKETS_PER_SECOND, 1_000L)
+        val bytes = FixedWindowPermitBudget(MAX_PEER_INGRESS_BYTES_PER_SECOND, 1_000L)
+    }
 
     private val bluetoothManager =
         context.getSystemService(Context.BLUETOOTH_SERVICE) as? BluetoothManager
@@ -70,8 +88,24 @@ class BleMeshManager(private val context: Context) {
     private val discoveredPeers = ConcurrentHashMap<String, PeerEndpoint>()
     private val clientSessions = ConcurrentHashMap<String, ClientSession>()
     private val fragmentAssembler = NearbyFrameFragmentCodec.Assembler()
+    private val ingressPacketBudget = FixedWindowPermitBudget(
+        MAX_INGRESS_PACKETS_PER_SECOND,
+        1_000L
+    )
+    private val ingressByteBudget = FixedWindowPermitBudget(
+        MAX_INGRESS_BYTES_PER_SECOND,
+        1_000L
+    )
+    private val peerIngressBudgets = BoundedExpiringPeerCache<String, PeerIngressBudget>(
+        MAX_DISCOVERED_PEERS,
+        PEER_EXPIRY_MS
+    )
     private var isAdvertising = false
     private var isScanning = false
+    private var activeScanMode: Int? = null
+    private var activeAdvertiseMode: Int? = null
+    private var activeTxPower: Int? = null
+    private var advertisedPresence: ByteArray? = null
 
     var onFrameReceivedListener: ((ByteArray, Int) -> Unit)? = null
     var onPeerDiscoveredListener: ((ByteArray, Int) -> Unit)? = null
@@ -101,18 +135,26 @@ class BleMeshManager(private val context: Context) {
     }
 
     @SuppressLint("MissingPermission")
-    fun startAdvertising(compactPresenceFrame: ByteArray) {
+    fun startAdvertising(
+        compactPresenceFrame: ByteArray,
+        advertiseMode: Int = AdvertiseSettings.ADVERTISE_MODE_LOW_POWER,
+        txPowerLevel: Int = AdvertiseSettings.ADVERTISE_TX_POWER_LOW
+    ) {
         require(compactPresenceFrame.size == OmniFrame.COMPACT_FRAME_SIZE) {
             "BLE advertisements must contain a ${OmniFrame.COMPACT_FRAME_SIZE}-byte presence frame"
         }
         if (bleAdvertiser == null) bleAdvertiser = bluetoothAdapter?.bluetoothLeAdvertiser
         val advertiser = bleAdvertiser ?: return
+        if (gattServer == null) setupGattServer()
+        if (isAdvertising && activeAdvertiseMode == advertiseMode && activeTxPower == txPowerLevel &&
+            advertisedPresence?.contentEquals(compactPresenceFrame) == true
+        ) return
 
         if (isAdvertising) runCatching { advertiser.stopAdvertising(advertiseCallback) }
 
         val settings = AdvertiseSettings.Builder()
-            .setAdvertiseMode(AdvertiseSettings.ADVERTISE_MODE_LOW_LATENCY)
-            .setTxPowerLevel(AdvertiseSettings.ADVERTISE_TX_POWER_HIGH)
+            .setAdvertiseMode(advertiseMode)
+            .setTxPowerLevel(txPowerLevel)
             .setConnectable(true)
             .build()
         val data = AdvertiseData.Builder()
@@ -123,6 +165,9 @@ class BleMeshManager(private val context: Context) {
         runCatching {
             advertiser.startAdvertising(settings, data, advertiseCallback)
             isAdvertising = true
+            activeAdvertiseMode = advertiseMode
+            activeTxPower = txPowerLevel
+            advertisedPresence = compactPresenceFrame.copyOf()
         }.onFailure {
             isAdvertising = false
             Log.e(TAG, "BLE advertising failed", it)
@@ -132,6 +177,10 @@ class BleMeshManager(private val context: Context) {
     /** Queues a full OmniFrame for a discovered paired peer. */
     @SuppressLint("MissingPermission")
     fun sendFrame(targetPublicKey: ByteArray, packedFrame: ByteArray): Boolean {
+        if (targetPublicKey.size < OmniFrame.COMPACT_KEY_PREFIX_SIZE ||
+            packedFrame.isEmpty() || packedFrame.size > MAX_GATT_FRAME_BYTES
+        ) return false
+        pruneDiscoveredPeers()
         val targetPrefix = targetPublicKey.copyOfRange(0, OmniFrame.COMPACT_KEY_PREFIX_SIZE)
         val endpoint = discoveredPeers[targetPrefix.toHex()] ?: return false
         val address = endpoint.device.address
@@ -139,10 +188,11 @@ class BleMeshManager(private val context: Context) {
         synchronized(clientSessions) {
             val existing = clientSessions[address]
             if (existing != null) {
-                enqueue(existing, packedFrame)
+                if (!enqueue(existing, packedFrame)) return false
                 drainWrites(existing)
                 return true
             }
+            if (clientSessions.size >= MAX_CLIENT_SESSIONS) return false
 
             val gatt = endpoint.device.connectGatt(
                 context,
@@ -151,79 +201,102 @@ class BleMeshManager(private val context: Context) {
                 BluetoothDevice.TRANSPORT_LE
             ) ?: return false
             val session = ClientSession(gatt)
-            enqueue(session, packedFrame)
+            if (!enqueue(session, packedFrame)) {
+                runCatching { gatt.close() }
+                return false
+            }
             clientSessions[address] = session
         }
         return true
     }
 
-    private fun enqueue(session: ClientSession, frame: ByteArray) {
-        synchronized(session) {
-            if (session.pendingFrames.size >= MAX_PENDING_FRAMES) session.pendingFrames.removeFirst()
-            session.pendingFrames.addLast(frame.copyOf())
-        }
+    /** Sends an opaque relay capsule to every currently discovered neighbor. */
+    fun broadcastPacket(packedPacket: ByteArray): Int {
+        if (!RelayCapsule.isCapsule(packedPacket) || packedPacket.size > MAX_GATT_FRAME_BYTES) return 0
+        pruneDiscoveredPeers()
+        return discoveredPeers.values
+            .sortedByDescending(PeerEndpoint::lastSeenMs)
+            .distinctBy { it.device.address }
+            .take(MAX_BROADCAST_NEIGHBORS)
+            .count { endpoint -> sendFrame(endpoint.keyPrefix, packedPacket) }
     }
+
+    private fun enqueue(session: ClientSession, frame: ByteArray): Boolean =
+        synchronized(session) {
+            if (session.pendingFrames.size >= MAX_PENDING_FRAMES ||
+                session.pendingBytes + frame.size > MAX_PENDING_BYTES
+            ) return@synchronized false
+            session.pendingFrames.addLast(frame.copyOf())
+            session.pendingBytes += frame.size
+            true
+        }
 
     @SuppressLint("MissingPermission")
     private fun drainWrites(session: ClientSession) {
-        val frame = synchronized(session) {
-            if (!session.ready || session.writeInFlight || session.pendingFrames.isEmpty()) return
-            session.pendingFrames.removeFirst().also { session.writeInFlight = true }
-        }
-
-        if (frame.size > session.mtuPayloadBytes) {
-            val fragments = NearbyFrameFragmentCodec.fragment(frame, session.mtuPayloadBytes)
-            synchronized(session) {
-                session.writeInFlight = false
-                for (index in fragments.indices.reversed()) session.pendingFrames.addFirst(fragments[index])
+        val packet = synchronized(session) {
+            if (!session.ready || session.writeInFlight) return
+            if (session.activeFragments.isEmpty()) {
+                if (session.pendingFrames.isEmpty()) return
+                val frame = session.pendingFrames.removeFirst()
+                session.pendingBytes -= frame.size
+                session.activeFragments.addAll(
+                    NearbyFrameFragmentCodec.fragment(frame, session.mtuPayloadBytes)
+                )
             }
-            drainWrites(session)
-            return
+            session.activeFragments.removeFirst().also { session.writeInFlight = true }
         }
 
         val characteristic = session.gatt.getService(OMNI_SERVICE_UUID)?.getCharacteristic(OMNI_CHAR_UUID)
         if (characteristic == null) {
             synchronized(session) { session.writeInFlight = false }
-            onDeliveryResultListener?.invoke(false, "OmniRelay GATT characteristic unavailable")
+            failAndClose(session.gatt, "OmniRelay GATT characteristic unavailable")
             return
         }
 
         val started = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
             session.gatt.writeCharacteristic(
                 characteristic,
-                frame,
+                packet,
                 BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT
             ) == BluetoothStatusCodes.SUCCESS
         } else {
             @Suppress("DEPRECATION")
-            characteristic.value = frame
+            characteristic.value = packet
             characteristic.writeType = BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT
             @Suppress("DEPRECATION")
             session.gatt.writeCharacteristic(characteristic)
         }
         if (!started) {
             synchronized(session) { session.writeInFlight = false }
-            onDeliveryResultListener?.invoke(false, "Unable to start BLE GATT write")
+            failAndClose(session.gatt, "Unable to start BLE GATT write")
         }
     }
 
     @SuppressLint("MissingPermission")
-    fun startActiveScanning() {
+    fun startActiveScanning(scanMode: Int = ScanSettings.SCAN_MODE_LOW_POWER) {
         if (bleScanner == null) bleScanner = bluetoothAdapter?.bluetoothLeScanner
         val scanner = bleScanner ?: return
-        if (isScanning) return
+        if (isScanning && activeScanMode == scanMode) return
+        if (isScanning) runCatching { scanner.stopScan(scanCallback) }
+        isScanning = false
+        activeScanMode = null
 
         val filter = ScanFilter.Builder()
-            .setManufacturerData(MANUFACTURER_ID, byteArrayOf(0x10), byteArrayOf(0xF0.toByte()))
+            .setManufacturerData(MANUFACTURER_ID, byteArrayOf(0x20), byteArrayOf(0xF0.toByte()))
             .build()
         val settings = ScanSettings.Builder()
-            .setScanMode(ScanSettings.SCAN_MODE_LOW_LATENCY)
+            .setScanMode(scanMode)
             .setCallbackType(ScanSettings.CALLBACK_TYPE_ALL_MATCHES)
             .build()
         runCatching {
             scanner.startScan(listOf(filter), settings, scanCallback)
             isScanning = true
-        }.onFailure { Log.e(TAG, "BLE scan start failed", it) }
+            activeScanMode = scanMode
+        }.onFailure {
+            isScanning = false
+            activeScanMode = null
+            Log.e(TAG, "BLE scan start failed", it)
+        }
     }
 
     @SuppressLint("MissingPermission")
@@ -231,6 +304,7 @@ class BleMeshManager(private val context: Context) {
         if (!isScanning) return
         runCatching { bleScanner?.stopScan(scanCallback) }
         isScanning = false
+        activeScanMode = null
     }
 
     @SuppressLint("MissingPermission")
@@ -238,6 +312,9 @@ class BleMeshManager(private val context: Context) {
         if (!isAdvertising) return
         runCatching { bleAdvertiser?.stopAdvertising(advertiseCallback) }
         isAdvertising = false
+        activeAdvertiseMode = null
+        activeTxPower = null
+        advertisedPresence = null
     }
 
     private val advertiseCallback = object : AdvertiseCallback() {
@@ -247,6 +324,9 @@ class BleMeshManager(private val context: Context) {
 
         override fun onStartFailure(errorCode: Int) {
             isAdvertising = false
+            activeAdvertiseMode = null
+            activeTxPower = null
+            advertisedPresence = null
             Log.e(TAG, "BLE advertising failed with error $errorCode")
         }
     }
@@ -270,8 +350,25 @@ class BleMeshManager(private val context: Context) {
         val compact = result.scanRecord?.getManufacturerSpecificData(MANUFACTURER_ID) ?: return
         val frame = OmniFrame.unpack(compact) ?: return
         val prefix = frame.ephemeralPublicKey.copyOfRange(0, OmniFrame.COMPACT_KEY_PREFIX_SIZE)
-        discoveredPeers[prefix.toHex()] = PeerEndpoint(result.device, prefix, System.currentTimeMillis())
+        val now = System.currentTimeMillis()
+        val key = prefix.toHex()
+        synchronized(discoveredPeers) {
+            pruneDiscoveredPeers(now)
+            if (!discoveredPeers.containsKey(key) && discoveredPeers.size >= MAX_DISCOVERED_PEERS) {
+                discoveredPeers.entries.minByOrNull { it.value.lastSeenMs }?.let { oldest ->
+                    discoveredPeers.remove(oldest.key, oldest.value)
+                }
+            }
+            discoveredPeers[key] = PeerEndpoint(result.device, prefix, now)
+        }
         onPeerDiscoveredListener?.invoke(prefix, result.rssi)
+    }
+
+    private fun pruneDiscoveredPeers(nowMs: Long = System.currentTimeMillis()) {
+        val cutoff = nowMs - PEER_EXPIRY_MS
+        synchronized(discoveredPeers) {
+            discoveredPeers.entries.removeIf { it.value.lastSeenMs < cutoff }
+        }
     }
 
     private val gattClientCallback = object : BluetoothGattCallback() {
@@ -314,10 +411,11 @@ class BleMeshManager(private val context: Context) {
         ) {
             val session = clientSessions[gatt.device.address] ?: return
             synchronized(session) { session.writeInFlight = false }
-            onDeliveryResultListener?.invoke(
-                status == BluetoothGatt.GATT_SUCCESS,
-                if (status == BluetoothGatt.GATT_SUCCESS) "Delivered over BLE GATT" else "BLE write failed ($status)"
-            )
+            if (status != BluetoothGatt.GATT_SUCCESS) {
+                failAndClose(gatt, "BLE write failed ($status)")
+                return
+            }
+            onDeliveryResultListener?.invoke(true, "Delivered over BLE GATT")
             drainWrites(session)
         }
     }
@@ -333,15 +431,25 @@ class BleMeshManager(private val context: Context) {
             offset: Int,
             value: ByteArray?
         ) {
-            val valid = characteristic?.uuid == OMNI_CHAR_UUID &&
+            val structurallyValid = characteristic?.uuid == OMNI_CHAR_UUID &&
                 !preparedWrite && offset == 0 && value != null && value.isNotEmpty()
-            if (valid && device != null) value.let { packet ->
+            val peerBudget = if (structurallyValid && device != null) {
+                peerIngressBudgets.getOrPut(device.address, ::PeerIngressBudget)
+            } else null
+            val admitted = structurallyValid && peerBudget != null &&
+                peerBudget.packets.tryAcquire(1) && peerBudget.bytes.tryAcquire(value.size) &&
+                ingressPacketBudget.tryAcquire(1) && ingressByteBudget.tryAcquire(value.size)
+            if (admitted && device != null) value.let { packet ->
                 fragmentAssembler.accept(device.address, packet)?.let { frame ->
                     onFrameReceivedListener?.invoke(frame, -50)
                 }
             }
             if (responseNeeded && device != null) {
-                val status = if (valid) BluetoothGatt.GATT_SUCCESS else BluetoothGatt.GATT_REQUEST_NOT_SUPPORTED
+                val status = when {
+                    admitted -> BluetoothGatt.GATT_SUCCESS
+                    structurallyValid -> BluetoothGatt.GATT_FAILURE
+                    else -> BluetoothGatt.GATT_REQUEST_NOT_SUPPORTED
+                }
                 runCatching { gattServer?.sendResponse(device, requestId, status, offset, null) }
             }
         }
@@ -361,6 +469,7 @@ class BleMeshManager(private val context: Context) {
         clientSessions.values.forEach { runCatching { it.gatt.close() } }
         clientSessions.clear()
         discoveredPeers.clear()
+        peerIngressBudgets.clear()
         runCatching { gattServer?.close() }
         gattServer = null
     }

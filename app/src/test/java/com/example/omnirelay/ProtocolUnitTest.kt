@@ -136,6 +136,74 @@ class ProtocolUnitTest {
     }
 
     @Test
+    fun identityPairValidationRejectsMismatchedKeys() {
+        val alice = CryptoEngine.generateX25519KeyPair()
+        val bob = CryptoEngine.generateX25519KeyPair()
+        assertTrue(CryptoEngine.isValidX25519KeyPair(alice))
+        assertFalse(CryptoEngine.isValidX25519KeyPair(
+            CryptoEngine.KeyPairData(alice.publicKey, bob.privateKey)
+        ))
+
+        val signer = CryptoEngine.generateEd25519KeyPair()
+        val otherSigner = CryptoEngine.generateEd25519KeyPair()
+        assertTrue(CryptoEngine.isValidEd25519KeyPair(signer))
+        assertFalse(CryptoEngine.isValidEd25519KeyPair(
+            CryptoEngine.SigningKeyPairData(signer.publicKeyDer, otherSigner.privateKeyDer)
+        ))
+    }
+
+    @Test
+    fun registrationChallengeRequiresTheSecretLinkPrivateKey() {
+        val device = CryptoEngine.generateX25519KeyPair()
+        val server = CryptoEngine.generateX25519KeyPair()
+        val attacker = CryptoEngine.generateX25519KeyPair()
+        val deviceId = CryptoEngine.deviceIdForPublicKey(device.publicKey)
+        val nonce = java.util.Base64.getEncoder().encodeToString(ByteArray(32) { 7 })
+        val signingPublic = java.util.Base64.getEncoder().encodeToString(ByteArray(44) { 9 })
+        val deviceProof = CryptoEngine.registrationX25519Proof(
+            device.privateKey,
+            server.publicKey,
+            deviceId,
+            nonce,
+            signingPublic
+        )
+        val serverExpected = CryptoEngine.registrationX25519Proof(
+            server.privateKey,
+            device.publicKey,
+            deviceId,
+            nonce,
+            signingPublic
+        )
+        val forged = CryptoEngine.registrationX25519Proof(
+            attacker.privateKey,
+            server.publicKey,
+            deviceId,
+            nonce,
+            signingPublic
+        )
+
+        assertArrayEquals(serverExpected, deviceProof)
+        assertFalse(serverExpected.contentEquals(forged))
+    }
+
+    @Test
+    fun registrationProofMatchesCrossLanguageRfc7748Vector() {
+        val alicePrivate = hex("77076d0a7318a57d3c16c17251b26645df4c2f87ebc0992ab177fba51db92c2a")
+        val bobPublic = hex("de9edb7d7b7dc1b4d35b61c2ece435373f8343c85b78674dadfc7e146f882b4f")
+        val proof = CryptoEngine.registrationX25519Proof(
+            alicePrivate,
+            bobPublic,
+            "300c9c9603b92a4b39ed3958bf9240114804db4fd373012c0ca47432d63425ae",
+            "BwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwc=",
+            "CQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQk="
+        )
+        assertArrayEquals(
+            hex("f1c18162243627d49a07b0b517b319c7307834eaa356d5e53ed7156451570345"),
+            proof
+        )
+    }
+
+    @Test
     fun testCallMediaKeyIsSharedAndBoundToCallId() {
         val alice = CryptoEngine.generateX25519KeyPair()
         val bob = CryptoEngine.generateX25519KeyPair()
@@ -163,4 +231,7 @@ class ProtocolUnitTest {
         assertArrayEquals(packet1, reconstructed[0])
         assertArrayEquals(packet2, reconstructed[1])
     }
+
+    private fun hex(value: String): ByteArray =
+        value.chunked(2).map { it.toInt(16).toByte() }.toByteArray()
 }

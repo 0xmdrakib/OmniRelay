@@ -4,6 +4,7 @@ import androidx.room.Dao
 import androidx.room.Insert
 import androidx.room.OnConflictStrategy
 import androidx.room.Query
+import androidx.room.Transaction
 import kotlinx.coroutines.flow.Flow
 
 @Dao
@@ -19,7 +20,7 @@ interface OmniDao {
 
     @Query(
         "SELECT * FROM outbound_envelopes " +
-            "WHERE state IN ('queued', 'failed') AND nextAttemptAtMs <= :nowMs " +
+            "WHERE state IN ('queued', 'failed', 'sending') AND nextAttemptAtMs <= :nowMs " +
             "ORDER BY createdAtMs ASC LIMIT :limit"
     )
     suspend fun pendingOutbound(nowMs: Long, limit: Int = 50): List<OutboundEnvelopeEntity>
@@ -28,10 +29,35 @@ interface OmniDao {
     suspend fun setOutboundState(envelopeId: String, state: String)
 
     @Query(
-        "UPDATE outbound_envelopes SET state = 'failed', attemptCount = attemptCount + 1, " +
-            "nextAttemptAtMs = :nextAttemptAtMs WHERE envelopeId = :envelopeId"
+        "UPDATE outbound_envelopes SET state = 'sending' " +
+            "WHERE envelopeId = :envelopeId AND state IN ('queued', 'failed')"
     )
-    suspend fun markOutboundRetry(envelopeId: String, nextAttemptAtMs: Long)
+    suspend fun markOutboundSendingIfPending(envelopeId: String): Int
+
+    @Query(
+        "UPDATE outbound_envelopes SET state = 'sent' " +
+            "WHERE envelopeId = :envelopeId AND state = 'sending'"
+    )
+    suspend fun markOutboundSentIfSending(envelopeId: String): Int
+
+    @Query(
+        "UPDATE outbound_envelopes SET state = 'sent' " +
+            "WHERE envelopeId = :envelopeId AND state IN ('queued', 'failed', 'sending')"
+    )
+    suspend fun markOutboundSentIfPending(envelopeId: String): Int
+
+    @Query(
+        "UPDATE outbound_envelopes SET state = 'cancelled' " +
+            "WHERE kind = 'call' AND callId = :callId AND state IN ('queued', 'failed', 'sending')"
+    )
+    suspend fun cancelPendingCall(callId: String)
+
+    @Query(
+        "UPDATE outbound_envelopes SET state = 'failed', attemptCount = attemptCount + 1, " +
+            "nextAttemptAtMs = :nextAttemptAtMs " +
+            "WHERE envelopeId = :envelopeId AND state = 'sending'"
+    )
+    suspend fun markOutboundRetryIfSending(envelopeId: String, nextAttemptAtMs: Long): Int
 
     @Query("UPDATE messages SET status = :status, transport = :transport WHERE messageId = :messageId")
     suspend fun updateMessageStatus(messageId: String, status: String, transport: String)
@@ -56,6 +82,17 @@ interface OmniDao {
 
     @Insert(onConflict = OnConflictStrategy.IGNORE)
     suspend fun markEnvelopeProcessed(envelope: ProcessedEnvelopeEntity): Long
+
+    @Transaction
+    suspend fun insertIncomingMessageOnce(
+        message: MessageEntity,
+        processed: ProcessedEnvelopeEntity
+    ): Boolean {
+        if (isEnvelopeProcessed(processed.envelopeId)) return false
+        val inserted = insertMessage(message) != -1L
+        markEnvelopeProcessed(processed)
+        return inserted
+    }
 
     @Query("DELETE FROM processed_envelopes WHERE processedAtMs < :beforeMs")
     suspend fun pruneProcessed(beforeMs: Long)

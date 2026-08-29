@@ -14,21 +14,32 @@ internal class LocalSecretProtector {
     companion object {
         private const val KEY_ALIAS = "omnirelay_identity_storage_v1"
         private const val IV_BYTES = 12
+        private const val FORMAT_PREFIX = "v2:"
     }
 
-    fun encrypt(value: ByteArray): String {
+    fun encrypt(value: ByteArray, purpose: String): String {
+        require(purpose.isNotBlank()) { "Secret purpose is required" }
         val cipher = Cipher.getInstance("AES/GCM/NoPadding")
         cipher.init(Cipher.ENCRYPT_MODE, getOrCreateKey())
-        return Base64.encodeToString(cipher.iv + cipher.doFinal(value), Base64.NO_WRAP)
+        cipher.updateAAD(purpose.toByteArray(Charsets.UTF_8))
+        return FORMAT_PREFIX + Base64.encodeToString(cipher.iv + cipher.doFinal(value), Base64.NO_WRAP)
     }
 
-    fun decrypt(encoded: String): ByteArray? = runCatching {
-        val packed = Base64.decode(encoded, Base64.NO_WRAP)
+    fun decrypt(encoded: String, purpose: String): ByteArray? = runCatching {
+        require(purpose.isNotBlank())
+        val isCurrentFormat = encoded.startsWith(FORMAT_PREFIX)
+        val packed = Base64.decode(
+            if (isCurrentFormat) encoded.removePrefix(FORMAT_PREFIX) else encoded,
+            Base64.NO_WRAP
+        )
         require(packed.size > IV_BYTES)
         val cipher = Cipher.getInstance("AES/GCM/NoPadding")
         cipher.init(Cipher.DECRYPT_MODE, getOrCreateKey(), GCMParameterSpec(128, packed, 0, IV_BYTES))
+        if (isCurrentFormat) cipher.updateAAD(purpose.toByteArray(Charsets.UTF_8))
         cipher.doFinal(packed.copyOfRange(IV_BYTES, packed.size))
     }.getOrNull()
+
+    fun needsMigration(encoded: String): Boolean = !encoded.startsWith(FORMAT_PREFIX)
 
     private fun getOrCreateKey(): SecretKey {
         val keyStore = KeyStore.getInstance("AndroidKeyStore").apply { load(null) }

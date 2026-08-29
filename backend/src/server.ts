@@ -1,42 +1,114 @@
 import Fastify, { type FastifyRequest } from "fastify";
-import { randomBytes } from "node:crypto";
+import { randomBytes, randomUUID } from "node:crypto";
+import { pathToFileURL } from "node:url";
 import websocket from "@fastify/websocket";
 import helmet from "@fastify/helmet";
 import rateLimit from "@fastify/rate-limit";
 import { AccessToken } from "livekit-server-sdk";
 import { z } from "zod";
 import { config } from "./config.js";
-import { deviceIdForPublicKey, issueDeviceToken, verifyRegistrationSignature } from "./identity.js";
+import { BoundedTaskQueue } from "./bounded-task-queue.js";
+import {
+  createX25519RegistrationChallenge,
+  deviceIdForPublicKey,
+  issueDeviceToken,
+  verifyRegistrationSignature,
+  x25519RegistrationProofMatches
+} from "./identity.js";
 import { RealtimeHub } from "./hub.js";
-import { createPushGateway, InvalidPushTokenError } from "./push.js";
-import { Repository, type Device } from "./repository.js";
-import { assertFrameBinding, parseOmniFrame, PayloadType } from "./protocol.js";
+import { createPushGateway, InvalidPushTokenError, type PushGateway } from "./push.js";
+import { Repository, UnauthorizedRouteError, type Device } from "./repository.js";
+import {
+  decodeRouteTokenHashBase64,
+  DEVICE_ID_PATTERN,
+  hashRouteTokenBase64,
+  isCanonicalBase64,
+  MAX_INBOUND_ROUTES
+} from "./route-authorization.js";
+import {
+  assertFrameBinding,
+  parseOmniFrame,
+  PayloadType,
+  remainingFrameLifetimeSeconds,
+  type ParsedOmniFrame
+} from "./protocol.js";
 
+function createRepository(): Repository {
+  return new Repository(config.DATABASE_URL, {
+    maxConnections: config.DATABASE_POOL_MAX,
+    idleTimeoutMillis: config.DATABASE_POOL_IDLE_TIMEOUT_MS,
+    connectionTimeoutMillis: config.DATABASE_CONNECTION_TIMEOUT_MS,
+    queryTimeoutMillis: config.DATABASE_QUERY_TIMEOUT_MS,
+    statementTimeoutMillis: config.DATABASE_STATEMENT_TIMEOUT_MS,
+    maxUses: config.DATABASE_POOL_MAX_USES
+  });
+}
+
+const canonicalBase64Bytes = (bytes: number) => z.string().refine(
+  (value) => isCanonicalBase64(value, bytes),
+  { message: `must be canonical base64 for exactly ${bytes} bytes` }
+);
+const deviceIdSchema = z.string().regex(DEVICE_ID_PATTERN);
 const registerSchema = z.object({
-  publicKeyBase64: z.string().min(43).max(64),
-  signingPublicKeyBase64: z.string().min(40).max(128),
-  nonceBase64: z.string().min(16).max(128),
-  signatureBase64: z.string().min(64).max(256),
+  challengeId: z.uuid(),
+  publicKeyBase64: canonicalBase64Bytes(32),
+  signingPublicKeyBase64: canonicalBase64Bytes(44),
+  nonceBase64: canonicalBase64Bytes(32),
+  signatureBase64: canonicalBase64Bytes(64),
+  x25519ProofBase64: canonicalBase64Bytes(32),
   fcmToken: z.string().min(10).max(4096).nullable().optional()
-});
+}).strict();
 const challengeSchema = z.object({
-  publicKeyBase64: z.string().min(43).max(64),
-  signingPublicKeyBase64: z.string().min(40).max(128)
-});
-const pushTokenSchema = z.object({ fcmToken: z.string().min(10).max(4096).nullable() });
+  publicKeyBase64: canonicalBase64Bytes(32),
+  signingPublicKeyBase64: canonicalBase64Bytes(44)
+}).strict();
+const pushTokenSchema = z.object({ fcmToken: z.string().min(10).max(4096).nullable() }).strict();
 const envelopeSchema = z.object({
   envelopeId: z.uuid(),
-  recipientDeviceId: z.string().regex(/^[0-9a-f]{64}$/),
+  recipientDeviceId: deviceIdSchema,
   kind: z.enum(["message", "call"]),
   callId: z.uuid().nullable().optional(),
-  frameBase64: z.string().min(88).max(88_000)
-});
+  frameBase64: z.string().min(88).max(88_000),
+  routeTokenBase64: canonicalBase64Bytes(32)
+}).strict();
 const callTransitionSchema = z.object({
   state: z.enum(["active", "declined", "ended"]),
   envelopeId: z.uuid(),
-  frameBase64: z.string().min(88).max(16_384)
+  frameBase64: z.string().min(88).max(16_384),
+  routeTokenBase64: canonicalBase64Bytes(32)
+}).strict();
+const inboundRoutesSchema = z.object({
+  routes: z.array(z.object({
+    senderDeviceId: deviceIdSchema,
+    routeTokenHashBase64: canonicalBase64Bytes(32)
+  }).strict()).max(MAX_INBOUND_ROUTES)
+}).strict().superRefine((value, context) => {
+  const seen = new Set<string>();
+  value.routes.forEach((route, index) => {
+    if (seen.has(route.senderDeviceId)) {
+      context.addIssue({
+        code: "custom",
+        message: "duplicate senderDeviceId",
+        path: ["routes", index, "senderDeviceId"]
+      });
+    }
+    seen.add(route.senderDeviceId);
+  });
 });
-const ackSchema = z.object({ state: z.enum(["delivered", "read"]) });
+const callLeaseSchema = z.object({}).strict();
+const ackSchema = z.object({ state: z.enum(["delivered", "read", "rejected"]) }).strict();
+
+export type BuildServerOptions = {
+  logger?: boolean;
+  maxInFlightRequests?: number;
+  httpMaxConnections?: number;
+  maxWebSocketConnections?: number;
+  pushConcurrency?: number;
+  pushMaxQueued?: number;
+  cleanupIntervalMs?: number;
+  cleanupBatchSize?: number;
+  pushGateway?: PushGateway;
+};
 
 function bearerToken(request: FastifyRequest): string | null {
   const header = request.headers.authorization;
@@ -48,19 +120,70 @@ function bearerToken(request: FastifyRequest): string | null {
 async function authenticatedDevice(request: FastifyRequest, repository: Repository): Promise<Device | null> {
   const deviceId = request.headers["x-device-id"];
   const token = bearerToken(request);
-  if (typeof deviceId !== "string" || !token) return null;
+  if (typeof deviceId !== "string" || !DEVICE_ID_PATTERN.test(deviceId) || !token) return null;
   return repository.authenticate(deviceId, token);
 }
 
-export async function buildServer(repository = new Repository(config.DATABASE_URL)) {
+export async function buildServer(repository = createRepository(), overrides: BuildServerOptions = {}) {
+  const runtime = {
+    maxInFlightRequests: overrides.maxInFlightRequests ?? config.MAX_IN_FLIGHT_REQUESTS,
+    httpMaxConnections: overrides.httpMaxConnections ?? config.HTTP_MAX_CONNECTIONS,
+    maxWebSocketConnections: overrides.maxWebSocketConnections ?? config.WEBSOCKET_MAX_CONNECTIONS,
+    pushConcurrency: overrides.pushConcurrency ?? config.PUSH_MAX_CONCURRENCY,
+    pushMaxQueued: overrides.pushMaxQueued ?? config.PUSH_MAX_QUEUED,
+    cleanupIntervalMs: overrides.cleanupIntervalMs ?? config.CLEANUP_INTERVAL_SECONDS * 1_000,
+    cleanupBatchSize: overrides.cleanupBatchSize ?? config.CLEANUP_BATCH_SIZE
+  };
+  if (!Number.isInteger(runtime.maxInFlightRequests) || runtime.maxInFlightRequests < 1) {
+    throw new Error("maxInFlightRequests must be a positive integer");
+  }
+  if (!Number.isInteger(runtime.cleanupIntervalMs) || runtime.cleanupIntervalMs < 1) {
+    throw new Error("cleanupIntervalMs must be a positive integer");
+  }
   const app = Fastify({
-    logger: true,
+    logger: overrides.logger ?? true,
     bodyLimit: 100_000,
-    requestTimeout: 15_000,
+    requestTimeout: config.HTTP_REQUEST_TIMEOUT_MS,
+    handlerTimeout: config.HTTP_REQUEST_TIMEOUT_MS,
+    keepAliveTimeout: 10_000,
+    maxRequestsPerSocket: 1_000,
+    forceCloseConnections: "idle",
+    return503OnClosing: true,
     trustProxy: config.TRUST_PROXY
   });
-  const hub = new RealtimeHub();
-  const push = createPushGateway(config.FIREBASE_SERVICE_ACCOUNT_JSON);
+  app.server.maxConnections = runtime.httpMaxConnections;
+  const hub = new RealtimeHub(runtime.maxWebSocketConnections);
+  const push = overrides.pushGateway ?? createPushGateway(config.FIREBASE_SERVICE_ACCOUNT_JSON);
+  const pushTasks = new BoundedTaskQueue(
+    runtime.pushConcurrency,
+    runtime.pushMaxQueued,
+    (error) => app.log.error({ error }, "Push task failed")
+  );
+  let droppedPushTasks = 0;
+  let inFlightRequests = 0;
+  const releaseRequestSlots = new WeakMap<FastifyRequest, () => void>();
+  app.addHook("onRequest", async (request, reply) => {
+    if (inFlightRequests >= runtime.maxInFlightRequests) {
+      return reply
+        .header("Retry-After", "1")
+        .header("Connection", "close")
+        .code(503)
+        .send({ error: "server_busy" });
+    }
+    inFlightRequests += 1;
+    let released = false;
+    const release = () => {
+      if (released) return;
+      released = true;
+      inFlightRequests -= 1;
+      releaseRequestSlots.delete(request);
+      reply.raw.off("finish", release);
+      reply.raw.off("close", release);
+    };
+    releaseRequestSlots.set(request, release);
+    reply.raw.once("finish", release);
+    reply.raw.once("close", release);
+  });
   const wakeDevice = async (deviceId: string, envelopeId: string, kind: "message" | "call") => {
     const fcmToken = await repository.fcmTokenFor(deviceId);
     if (!fcmToken) return;
@@ -71,8 +194,16 @@ export async function buildServer(repository = new Repository(config.DATABASE_UR
       app.log.warn({ error, deviceId }, "FCM wake failed");
     }
   };
+  const scheduleWake = (deviceId: string, envelopeId: string, kind: "message" | "call") => {
+    if (!push.enabled) return;
+    if (pushTasks.submit(() => wakeDevice(deviceId, envelopeId, kind))) return;
+    droppedPushTasks += 1;
+    if (droppedPushTasks === 1 || droppedPushTasks % 100 === 0) {
+      app.log.warn({ droppedPushTasks }, "Push queue full; durable mailbox wake was dropped");
+    }
+  };
   await app.register(helmet, { contentSecurityPolicy: false });
-  await app.register(rateLimit, { max: 300, timeWindow: "1 minute" });
+  await app.register(rateLimit, { max: 300, timeWindow: "1 minute", cache: 5_000 });
   await app.register(websocket, { options: { maxPayload: 4096 } });
 
   app.get("/healthz", async (_request, reply) => {
@@ -92,13 +223,31 @@ export async function buildServer(repository = new Repository(config.DATABASE_UR
       return reply.code(409).send({ error: "signing_identity_mismatch" });
     }
     const nonceBase64 = randomBytes(32).toString("base64");
-    await repository.saveRegistrationChallenge(
+    const x25519Challenge = createX25519RegistrationChallenge(
+      parsed.data.publicKeyBase64,
+      deviceId,
+      nonceBase64,
+      parsed.data.signingPublicKeyBase64
+    );
+    const challengeId = randomUUID();
+    const saved = await repository.saveRegistrationChallenge(
+      challengeId,
       deviceId,
       parsed.data.publicKeyBase64,
       parsed.data.signingPublicKeyBase64,
-      nonceBase64
+      nonceBase64,
+      x25519Challenge.expectedProofBase64,
+      config.MAX_REGISTRATION_CHALLENGES_PER_DEVICE
     );
-    return reply.send({ deviceId, nonceBase64 });
+    if (!saved) {
+      return reply.header("Retry-After", "300").code(429).send({ error: "registration_challenge_limit" });
+    }
+    return reply.send({
+      challengeId,
+      deviceId,
+      nonceBase64,
+      serverEphemeralPublicKeyBase64: x25519Challenge.serverEphemeralPublicKeyBase64
+    });
   });
 
   app.post("/v1/devices/register", { config: { rateLimit: { max: 20, timeWindow: "1 minute" } } }, async (request, reply) => {
@@ -110,10 +259,14 @@ export async function buildServer(repository = new Repository(config.DATABASE_UR
     } catch {
       return reply.code(400).send({ error: "invalid_public_key" });
     }
-    const challenge = await repository.consumeRegistrationChallenge(deviceId);
+    const challenge = await repository.registrationChallenge(parsed.data.challengeId, deviceId);
     if (!challenge || challenge.nonceBase64 !== parsed.data.nonceBase64 ||
         challenge.publicKeyBase64 !== parsed.data.publicKeyBase64 ||
         challenge.signingPublicKeyBase64 !== parsed.data.signingPublicKeyBase64 ||
+        !x25519RegistrationProofMatches(
+          challenge.x25519ProofBase64,
+          parsed.data.x25519ProofBase64
+        ) ||
         !verifyRegistrationSignature(
           parsed.data.signingPublicKeyBase64,
           deviceId,
@@ -122,6 +275,8 @@ export async function buildServer(repository = new Repository(config.DATABASE_UR
         )) {
       return reply.code(401).send({ error: "invalid_registration_proof" });
     }
+    const consumed = await repository.consumeRegistrationChallenge(parsed.data.challengeId, deviceId);
+    if (!consumed) return reply.code(401).send({ error: "invalid_registration_proof" });
     const token = issueDeviceToken();
     const registered = await repository.registerOrRotate(
       deviceId,
@@ -143,6 +298,23 @@ export async function buildServer(repository = new Repository(config.DATABASE_UR
     return reply.code(204).send();
   });
 
+  app.put("/v1/routes/inbound", {
+    config: { rateLimit: { max: 10, timeWindow: "1 minute" } }
+  }, async (request, reply) => {
+    const device = await authenticatedDevice(request, repository);
+    if (!device) return reply.code(401).send({ error: "unauthorized" });
+    const parsed = inboundRoutesSchema.safeParse(request.body);
+    if (!parsed.success || parsed.data.routes.some((route) => route.senderDeviceId === device.deviceId)) {
+      return reply.code(400).send({ error: "invalid_request" });
+    }
+    const routes = parsed.data.routes.map((route) => ({
+      senderId: route.senderDeviceId,
+      routeTokenHash: decodeRouteTokenHashBase64(route.routeTokenHashBase64)
+    }));
+    await repository.replaceInboundRoutes(device.deviceId, routes);
+    return reply.code(204).send();
+  });
+
   app.post("/v1/envelopes", async (request, reply) => {
     const device = await authenticatedDevice(request, repository);
     if (!device) return reply.code(401).send({ error: "unauthorized" });
@@ -156,8 +328,9 @@ export async function buildServer(repository = new Repository(config.DATABASE_UR
     if (data.kind === "message" && data.callId) {
       return reply.code(400).send({ error: "call_id_not_allowed" });
     }
+    let frame: ParsedOmniFrame;
     try {
-      const frame = parseOmniFrame(data.frameBase64);
+      frame = parseOmniFrame(data.frameBase64);
       assertFrameBinding(
         frame,
         device.publicKeyBase64,
@@ -167,33 +340,89 @@ export async function buildServer(repository = new Repository(config.DATABASE_UR
     } catch {
       return reply.code(400).send({ error: "invalid_frame" });
     }
+    const routeTokenHash = hashRouteTokenBase64(data.routeTokenBase64);
+    const envelopeInput = {
+      envelopeId: data.envelopeId,
+      senderId: device.deviceId,
+      recipientId: data.recipientDeviceId,
+      kind: data.kind,
+      callId: data.callId ?? null,
+      frameBase64: data.frameBase64
+    };
+    let insertResult: "inserted" | "duplicate";
     if (data.kind === "call") {
       if (!data.callId) return reply.code(400).send({ error: "call_id_required" });
-      const callResult = await repository.ensureCall(data.callId, device.deviceId, data.recipientDeviceId);
-      if (callResult === "conflict") return reply.code(409).send({ error: "call_id_conflict" });
-    }
-    let insertResult: "inserted" | "duplicate" | "conflict";
-    try {
-      insertResult = await repository.insertEnvelope({
-        envelopeId: data.envelopeId,
-        senderId: device.deviceId,
-        recipientId: data.recipientDeviceId,
-        kind: data.kind,
-        callId: data.callId ?? null,
-        frameBase64: data.frameBase64
-      }, config.MESSAGE_TTL_DAYS, config.MAX_MAILBOX_MESSAGES);
-    } catch (error) {
-      if (error instanceof Error && error.message === "mailbox_full") {
-        return reply.code(429).send({ error: "recipient_mailbox_full" });
+      const remainingCallTtl = remainingFrameLifetimeSeconds(
+        frame.timestampMsLow32,
+        config.CALL_SIGNAL_TTL_SECONDS,
+        config.CALL_MAX_FUTURE_SKEW_SECONDS
+      );
+      if (remainingCallTtl === null) {
+        const authorized = await repository.routeAuthorized(
+          device.deviceId,
+          data.recipientDeviceId,
+          routeTokenHash
+        );
+        if (!authorized) return reply.code(403).send({ error: "unauthorized_route" });
+        return reply.code(200).send({ envelopeId: data.envelopeId, duplicate: false, expired: true });
       }
-      throw error;
-    }
-    if (insertResult === "conflict") {
-      return reply.code(409).send({ error: "envelope_id_conflict" });
+      try {
+        const callResult = await repository.createCallWithEnvelope(
+          { ...envelopeInput, kind: "call", callId: data.callId },
+          remainingCallTtl,
+          config.MAX_MAILBOX_MESSAGES,
+          config.MAX_PENDING_MESSAGES_PER_PAIR,
+          routeTokenHash
+        );
+        if (callResult === "call_conflict") return reply.code(409).send({ error: "call_id_conflict" });
+        if (callResult === "envelope_conflict") {
+          return reply.code(409).send({ error: "envelope_id_conflict" });
+        }
+        if (callResult === "expired") {
+          return reply.code(200).send({ envelopeId: data.envelopeId, duplicate: false, expired: true });
+        }
+        insertResult = callResult;
+      } catch (error) {
+        if (error instanceof UnauthorizedRouteError) {
+          return reply.code(403).send({ error: "unauthorized_route" });
+        }
+        if (error instanceof Error && error.message === "mailbox_full") {
+          return reply.code(429).send({ error: "recipient_mailbox_full" });
+        }
+        if (error instanceof Error && error.message === "pair_mailbox_full") {
+          return reply.code(429).send({ error: "sender_recipient_queue_full" });
+        }
+        throw error;
+      }
+    } else {
+      try {
+        const messageResult = await repository.insertEnvelope(
+          { ...envelopeInput, kind: "message", callId: null },
+          config.MESSAGE_TTL_DAYS * 24 * 60 * 60,
+          config.MAX_MAILBOX_MESSAGES,
+          config.MAX_PENDING_MESSAGES_PER_PAIR,
+          routeTokenHash
+        );
+        if (messageResult === "conflict") {
+          return reply.code(409).send({ error: "envelope_id_conflict" });
+        }
+        insertResult = messageResult;
+      } catch (error) {
+        if (error instanceof UnauthorizedRouteError) {
+          return reply.code(403).send({ error: "unauthorized_route" });
+        }
+        if (error instanceof Error && error.message === "mailbox_full") {
+          return reply.code(429).send({ error: "recipient_mailbox_full" });
+        }
+        if (error instanceof Error && error.message === "pair_mailbox_full") {
+          return reply.code(429).send({ error: "sender_recipient_queue_full" });
+        }
+        throw error;
+      }
     }
     if (insertResult === "inserted") {
       hub.notify(data.recipientDeviceId, data.envelopeId, data.kind);
-      void wakeDevice(data.recipientDeviceId, data.envelopeId, data.kind);
+      scheduleWake(data.recipientDeviceId, data.envelopeId, data.kind);
     }
     return reply.code(insertResult === "inserted" ? 201 : 200).send({
       envelopeId: data.envelopeId,
@@ -234,6 +463,12 @@ export async function buildServer(repository = new Repository(config.DATABASE_UR
     const params = z.object({ callId: z.uuid() }).safeParse(request.params);
     const body = callTransitionSchema.safeParse(request.body);
     if (!params.success || !body.success) return reply.code(400).send({ error: "invalid_request" });
+    let transitionFrame: ParsedOmniFrame;
+    try {
+      transitionFrame = parseOmniFrame(body.data.frameBase64);
+    } catch {
+      return reply.code(400).send({ error: "invalid_frame" });
+    }
     const call = await repository.callForParticipant(params.data.callId, device.deviceId);
     if (!call) return reply.code(404).send({ error: "call_not_found" });
     const otherDeviceId = call.callerId === device.deviceId ? call.calleeId : call.callerId;
@@ -244,7 +479,7 @@ export async function buildServer(repository = new Repository(config.DATABASE_UR
       : body.data.state === "declined" ? PayloadType.CALL_DECLINE : PayloadType.CALL_END;
     try {
       assertFrameBinding(
-        parseOmniFrame(body.data.frameBase64),
+        transitionFrame,
         device.publicKeyBase64,
         recipientPublicKey,
         expectedType
@@ -252,22 +487,77 @@ export async function buildServer(repository = new Repository(config.DATABASE_UR
     } catch {
       return reply.code(400).send({ error: "invalid_frame" });
     }
-    const transition = await repository.transitionCall(params.data.callId, device.deviceId, body.data.state);
-    if (!transition) return reply.code(409).send({ error: "invalid_call_transition" });
-    const insertResult = await repository.insertEnvelope({
-      envelopeId: body.data.envelopeId,
-      senderId: device.deviceId,
-      recipientId: transition.otherDeviceId,
-      kind: "call",
-      callId: params.data.callId,
-      frameBase64: body.data.frameBase64
-    }, 1, config.MAX_MAILBOX_MESSAGES);
-    if (insertResult === "conflict") return reply.code(409).send({ error: "envelope_id_conflict" });
-    if (insertResult === "inserted") {
+    const routeTokenHash = hashRouteTokenBase64(body.data.routeTokenBase64);
+    const remainingCallTtl = remainingFrameLifetimeSeconds(
+      transitionFrame.timestampMsLow32,
+      config.CALL_SIGNAL_TTL_SECONDS,
+      config.CALL_MAX_FUTURE_SKEW_SECONDS
+    );
+    if (remainingCallTtl === null) {
+      const authorized = await repository.routeAuthorized(device.deviceId, otherDeviceId, routeTokenHash);
+      if (!authorized) return reply.code(403).send({ error: "unauthorized_route" });
+      return reply.code(204).send();
+    }
+    let transition: Awaited<ReturnType<Repository["transitionCallWithEnvelope"]>>;
+    try {
+      transition = await repository.transitionCallWithEnvelope(
+        params.data.callId,
+        device.deviceId,
+        body.data.state,
+        {
+          envelopeId: body.data.envelopeId,
+          senderId: device.deviceId,
+          recipientId: otherDeviceId,
+          kind: "call",
+          callId: params.data.callId,
+          frameBase64: body.data.frameBase64
+        },
+        remainingCallTtl,
+        config.CALL_ACTIVE_LEASE_SECONDS,
+        config.MAX_MAILBOX_MESSAGES,
+        config.MAX_PENDING_MESSAGES_PER_PAIR,
+        routeTokenHash
+      );
+    } catch (error) {
+      if (error instanceof UnauthorizedRouteError) {
+        return reply.code(403).send({ error: "unauthorized_route" });
+      }
+      if (error instanceof Error &&
+          (error.message === "mailbox_full" || error.message === "pair_mailbox_full")) {
+        return reply.code(429).send({ error: "call_signal_queue_full" });
+      }
+      throw error;
+    }
+    if (transition.status === "not_found") return reply.code(404).send({ error: "call_not_found" });
+    if (transition.status === "invalid") return reply.code(409).send({ error: "invalid_call_transition" });
+    if (transition.status === "envelope_conflict") {
+      return reply.code(409).send({ error: "envelope_id_conflict" });
+    }
+    if (transition.status === "inserted") {
       hub.notify(transition.otherDeviceId, body.data.envelopeId, "call");
-      void wakeDevice(transition.otherDeviceId, body.data.envelopeId, "call");
+      scheduleWake(transition.otherDeviceId, body.data.envelopeId, "call");
     }
     return reply.code(204).send();
+  });
+
+  app.post("/v1/calls/:callId/lease", {
+    config: { rateLimit: { max: 20, timeWindow: "1 minute" } }
+  }, async (request, reply) => {
+    const device = await authenticatedDevice(request, repository);
+    if (!device) return reply.code(401).send({ error: "unauthorized" });
+    const params = z.object({ callId: z.uuid() }).safeParse(request.params);
+    const body = callLeaseSchema.safeParse(request.body ?? {});
+    if (!params.success || !body.success) return reply.code(400).send({ error: "invalid_request" });
+    const leaseExpiresAt = await repository.renewCallLease(
+      params.data.callId,
+      device.deviceId,
+      config.CALL_ACTIVE_LEASE_SECONDS
+    );
+    if (!leaseExpiresAt) return reply.code(404).send({ error: "call_not_available" });
+    return reply.send({
+      leaseSeconds: config.CALL_ACTIVE_LEASE_SECONDS,
+      leaseExpiresAt
+    });
   });
 
   app.post("/v1/calls/:callId/token", async (request, reply) => {
@@ -281,19 +571,24 @@ export async function buildServer(repository = new Repository(config.DATABASE_UR
     }
     const token = new AccessToken(config.LIVEKIT_API_KEY, config.LIVEKIT_API_SECRET, {
       identity: device.deviceId,
-      ttl: "10m"
+      ttl: `${config.CALL_ACTIVE_LEASE_SECONDS}s`
     });
     token.addGrant({ roomJoin: true, room: params.data.callId, canPublish: true, canSubscribe: true });
     return reply.send({ url: config.LIVEKIT_URL, token: await token.toJwt() });
   });
 
   app.get("/v1/stream", { websocket: true }, async (socket, request) => {
-    const device = await authenticatedDevice(request, repository);
+    let device: Device | null;
+    try {
+      device = await authenticatedDevice(request, repository);
+    } finally {
+      releaseRequestSlots.get(request)?.();
+    }
     if (!device) {
       socket.close(1008, "unauthorized");
       return;
     }
-    hub.add(device.deviceId, socket);
+    if (!hub.add(device.deviceId, socket)) return;
     socket.send(JSON.stringify({ type: "ready" }));
     socket.on("message", (data) => {
       if (data.toString() === "ping") socket.send("pong");
@@ -301,24 +596,81 @@ export async function buildServer(repository = new Repository(config.DATABASE_UR
     socket.on("close", () => hub.remove(device.deviceId, socket));
   });
 
-  const cleanupTimer = setInterval(() => repository.cleanup().catch((error) => app.log.error(error)), 60 * 60 * 1000);
+  let cleanupPromise: Promise<void> | null = null;
+  let closing = false;
+  const runCleanup = () => {
+    if (closing) return Promise.resolve();
+    if (cleanupPromise) return cleanupPromise;
+    cleanupPromise = repository.cleanup(runtime.cleanupBatchSize)
+      .then((deleted) => {
+        if (deleted.envelopes + deleted.calls + deleted.challenges > 0) {
+          app.log.info({ deleted }, "Expired records cleaned");
+        }
+      })
+      .catch((error) => app.log.error(error, "Cleanup failed"))
+      .finally(() => { cleanupPromise = null; });
+    return cleanupPromise;
+  };
+  const cleanupTimer = setInterval(runCleanup, runtime.cleanupIntervalMs);
   cleanupTimer.unref();
   app.addHook("onClose", async () => {
+    closing = true;
     clearInterval(cleanupTimer);
+    const pushShutdown = pushTasks.shutdown(true);
+    await cleanupPromise;
+    await pushShutdown;
+    if (droppedPushTasks > 0) {
+      app.log.info({ droppedPushTasks }, "Push tasks dropped while protecting server capacity");
+    }
     await repository.close();
   });
   return app;
 }
 
-if (process.env.NODE_ENV !== "test") {
-  const repository = new Repository(config.DATABASE_URL);
-  await repository.migrate();
-  const app = await buildServer(repository);
-  await app.listen({ host: config.HOST, port: config.PORT });
-  const shutdown = async () => {
-    await app.close();
-    process.exit(0);
+export async function startServer() {
+  const repository = createRepository();
+  let app: Awaited<ReturnType<typeof buildServer>> | null = null;
+  try {
+    await repository.migrate();
+    app = await buildServer(repository);
+    await app.listen({ host: config.HOST, port: config.PORT });
+  } catch (error) {
+    if (app) {
+      await app.close().catch(() => undefined);
+    } else {
+      await repository.close().catch(() => undefined);
+    }
+    throw error;
+  }
+
+  let shutdownPromise: Promise<void> | null = null;
+  const shutdown = (signal: NodeJS.Signals) => {
+    if (shutdownPromise) return;
+    app.log.info({ signal }, "Graceful shutdown started");
+    const deadline = setTimeout(() => {
+      app.log.error({ signal, timeoutMs: config.SHUTDOWN_TIMEOUT_MS }, "Graceful shutdown deadline exceeded");
+      process.exit(1);
+    }, config.SHUTDOWN_TIMEOUT_MS);
+    deadline.unref();
+    shutdownPromise = app.close()
+      .then(() => {
+        process.exitCode = 0;
+      })
+      .catch((error) => {
+        app.log.error({ error, signal }, "Graceful shutdown failed");
+        process.exitCode = 1;
+      })
+      .finally(() => clearTimeout(deadline));
   };
   process.once("SIGTERM", shutdown);
   process.once("SIGINT", shutdown);
+  return app;
+}
+
+const entryPoint = process.argv[1];
+if (entryPoint && import.meta.url === pathToFileURL(entryPoint).href) {
+  await startServer().catch((error) => {
+    console.error("OmniRelay backend failed to start", error);
+    process.exitCode = 1;
+  });
 }

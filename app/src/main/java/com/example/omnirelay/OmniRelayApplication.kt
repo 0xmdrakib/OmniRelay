@@ -54,8 +54,16 @@ class OmniRelayApplication : Application() {
 
     private fun schedulePeriodicRelaySync() {
         if (BuildConfig.BACKEND_BASE_URL.endsWith(".invalid")) return
-        val request = PeriodicWorkRequestBuilder<RelaySyncWorker>(15, TimeUnit.MINUTES)
-            .setConstraints(Constraints.Builder().setRequiredNetworkType(NetworkType.CONNECTED).build())
+        val request = PeriodicWorkRequestBuilder<RelaySyncWorker>(
+            15, TimeUnit.MINUTES,
+            5, TimeUnit.MINUTES
+        )
+            .setConstraints(
+                Constraints.Builder()
+                    .setRequiredNetworkType(NetworkType.CONNECTED)
+                    .setRequiresBatteryNotLow(true)
+                    .build()
+            )
             .build()
         WorkManager.getInstance(this).enqueueUniquePeriodicWork(
             "omnirelay-periodic-mailbox-sync",

@@ -25,5 +25,6 @@ data class OutboundEnvelopeEntity(
         const val STATE_SENDING = "sending"
         const val STATE_SENT = "sent"
         const val STATE_FAILED = "failed"
+        const val STATE_CANCELLED = "cancelled"
     }
 }
