@@ -65,7 +65,7 @@ class PermissionCapabilityPlannerTest {
     }
 
     @Test
-    fun api31SeparatesBluetoothFromWifiAwareLocation() {
+    fun api31SeparatesBluetoothAndRequestsApproximateWithPreciseWifiAwareLocation() {
         val plan = PermissionCapabilityPlanner.plan(
             apiLevel = 31,
             granted = GrantedPermissions(
@@ -81,7 +81,10 @@ class PermissionCapabilityPlannerTest {
         assertTrue(plan.capabilities.backgroundIncomingAlerts)
         assertTrue(plan.permissionGroups.none { it.stage == PermissionStage.ENABLE_BLUETOOTH_NEARBY })
         val wifiGroup = plan.group(PermissionStage.ENABLE_WIFI_AWARE)
-        assertEquals(setOf(RuntimePermission.FINE_LOCATION), wifiGroup.permissions)
+        assertEquals(
+            setOf(RuntimePermission.COARSE_LOCATION, RuntimePermission.FINE_LOCATION),
+            wifiGroup.permissions
+        )
         assertTrue(wifiGroup.rationale.contains("require precise location permission"))
     }
 

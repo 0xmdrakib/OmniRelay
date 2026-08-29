@@ -64,7 +64,10 @@ object PermissionCapabilityPlanner {
 
     data class PermissionRequestGroup(
         val stage: PermissionStage,
-        /** Contains only missing permissions related to this one user-visible feature. */
+        /**
+         * Permissions the platform layer must include for this one user-visible feature.
+         * Android can require an already-granted companion permission in the same request.
+         */
         val permissions: Set<RuntimePermission>,
         val title: String,
         val rationale: String
@@ -199,10 +202,17 @@ object PermissionCapabilityPlanner {
 
             when {
                 (apiLevel in 26..28 || apiLevel in 31..32) && !granted.fineLocation -> {
+                    val locationPermissions = if (apiLevel in 31..32) {
+                        // Android 12/12L ignores a precise-location request unless approximate
+                        // and precise location are requested together in the same dialog.
+                        setOf(RuntimePermission.COARSE_LOCATION, RuntimePermission.FINE_LOCATION)
+                    } else {
+                        setOf(RuntimePermission.FINE_LOCATION)
+                    }
                     add(
                         PermissionRequestGroup(
                             stage = PermissionStage.ENABLE_WIFI_AWARE,
-                            permissions = setOf(RuntimePermission.FINE_LOCATION),
+                            permissions = locationPermissions,
                             title = "Find devices through Wi-Fi Aware",
                             rationale = "Android versions before Android 13 require precise location " +
                                 "permission for Wi-Fi Aware discovery. OmniRelay uses this access to " +
