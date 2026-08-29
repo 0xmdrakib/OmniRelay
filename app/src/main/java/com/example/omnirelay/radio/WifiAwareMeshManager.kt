@@ -477,6 +477,9 @@ class WifiAwareMeshManager(
         }
 
         if (WifiAwareNdpProtocol.isControl(message)) {
+            // Socket NDP controls are defined only for API 29+. Older devices use the encrypted
+            // follow-up fallback and must never enter code that references public Q-only NDP APIs.
+            if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) return
             val prefix = WifiAwareNdpProtocol.peekControlSenderPrefix(message) ?: return
             val credentials = credentialsFor(prefix) ?: return
             val control = WifiAwareNdpProtocol.decodeControl(message, credentials.sharedSecret) ?: return
