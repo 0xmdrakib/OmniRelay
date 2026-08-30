@@ -3,8 +3,6 @@
 OmniRelay is a native Android app for private, end-to-end encrypted messaging
 and voice calls, with a self-hosted internet relay and nearby radio fallback.
 
-**Status:** Pre-release · Android 8.0+ · Physical-device validation pending
-
 **Official website:** [omnirelay.rakibhq.xyz](https://omnirelay.rakibhq.xyz)
 
 ---
@@ -83,48 +81,6 @@ exists.
 - **Backend:** Node.js 24, TypeScript, Fastify, WebSocket, and PostgreSQL
 - **Infrastructure:** Docker Compose, Caddy TLS, and GitHub Actions
 - **Public showcase:** isolated static Vite site under `website/`, configured for Vercel
-
-## Getting started
-
-Clone the repository:
-
-```powershell
-git clone https://github.com/0xmdrakib/OmniRelay.git
-cd OmniRelay
-```
-
-Follow the [setup guide](docs/SETUP.md) to start the local server, build a
-configured APK, and pair two Android phones. For a public server, use the
-[production deployment guide](docs/SETUP.md#production-deployment).
-
-Credentials, signing keys, local configuration, and build artifacts stay outside
-Git. Never commit deployment secrets; store them on the server or in a secrets
-manager.
-
-The [public showcase](https://omnirelay.rakibhq.xyz) is built only from
-[`website/`](website/). Configure that folder as the Vercel project Root
-Directory; its production bundle contains no Android or backend source. APK
-buttons point to the official GitHub Releases page.
-
-## Testing and release
-
-The [CI workflow](.github/workflows/ci.yml) runs Android unit tests, lint,
-debug/release builds, backend checks and integration tests, an isolated website
-bundle gate, a Docker image build, and full-history secret scanning. See the [test commands](docs/SETUP.md#tests)
-to run the checks locally.
-
-This is not yet a production release. Two-phone audio, three-phone nearby relay,
-background delivery, Doze/OEM behavior, and real Firebase/public-network paths
-still need physical-device testing. Automated checks do not establish those
-guarantees.
-
-The current wire-v2 protocol rejects vulnerable v1 frames and binds direction,
-identities, and immutable metadata into AEAD. It still uses long-lived contact
-keys and does not offer
-Double Ratchet forward secrecy or post-compromise security. Review the
-[security evolution plan](docs/SECURITY_EVOLUTION.md), the
-[threat model](docs/THREAT_MODEL.md), and the
-[release checklist](docs/RELEASE_CHECKLIST.md) before launch.
 
 ## Documentation
 
