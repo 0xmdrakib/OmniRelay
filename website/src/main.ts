@@ -9,10 +9,6 @@ document.querySelectorAll<HTMLAnchorElement>("[data-release-link]").forEach((lin
   link.title = "Open the official OmniRelay release page";
 });
 
-document.querySelectorAll<HTMLElement>("[data-current-year]").forEach((element) => {
-  element.textContent = new Date().getFullYear().toString();
-});
-
 const menuButton = document.querySelector<HTMLButtonElement>(".menu-button");
 const navigation = document.querySelector<HTMLElement>("#site-nav");
 

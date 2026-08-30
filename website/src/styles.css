@@ -137,7 +137,8 @@ p { line-height: 1.6; }
 
 .release-section { margin-bottom: 120px; display: grid; grid-template-columns: minmax(0, .9fr) minmax(440px, 1.1fr); overflow: hidden; border-radius: var(--radius-xl); background: var(--surface-soft); }.release-copy { align-self:center; padding:64px }.release-copy p:not(.section-label) { max-width:520px; margin-bottom:28px; color:var(--muted) }.release-art { min-height: 520px; margin:0; overflow:hidden; background:var(--surface-card) }.release-art img { width:100%; height:100%; object-fit:cover; object-position:65% center; }
 
-.site-footer { padding-block: 80px 30px; background: var(--surface-soft); }.footer-grid { display:grid; grid-template-columns:1.4fr .65fr .65fr 1fr; gap:48px; }.footer-grid > div { display:flex; flex-direction:column; align-items:flex-start; gap:12px; }.footer-grid > div > strong { color:var(--ink); font-size:13px }.footer-grid a:not(.brand),.footer-grid p { margin:0; color:var(--muted); font-size:13px; line-height:1.55 }.footer-grid .brand { margin-bottom:8px }.footer-note { padding:22px; border-radius:var(--radius-lg); background:var(--surface-card) }.footer-bottom { margin-top:64px; padding-top:22px; display:flex; justify-content:space-between; border-top:1px solid var(--hairline); color:var(--muted); font-size:12px; }
+.site-footer { padding: 30px 16px; border-top: 1px solid var(--hairline); background: var(--surface-soft); }
+.footer-signature { margin: 0 auto; color: var(--muted); font-size: 13px; line-height: 1.6; text-align: center; }
 
 @media (max-width: 1080px) {
   .hero { grid-template-columns: minmax(0, 1.1fr) minmax(390px, .9fr); gap: 36px; }
@@ -155,18 +156,18 @@ p { line-height: 1.6; }
   .site-nav a { padding-inline: 12px; }
   .site-nav .nav-download { justify-content: center; margin-top: 8px; }
   .hero { min-height: auto; padding-block: 72px 80px; grid-template-columns: 1fr; gap: 48px; }
-  .hero h1 { font-size: clamp(45px, 14vw, 64px); }
+  .hero h1 { font-size: clamp(40px, 13.5vw, 64px); overflow-wrap: anywhere; }
   .hero-lead { font-size: 16px; }
   .hero-actions { align-items: stretch; flex-direction: column; }.hero-actions .button { width:100%; }
   .route-console { min-height: auto; padding: 20px; }
-  .peer-row { grid-template-columns: 1fr 42px 1fr; }.relay-line::before { width:38px }.peer-orb { width:36px;height:36px }.peer strong { font-size:12px }.peer small { display:none }
+  .peer-row { grid-template-columns: minmax(0, 1fr) 42px minmax(0, 1fr); }.relay-line::before { width:38px }.peer-orb { width:36px;height:36px }.peer strong { font-size:12px; overflow-wrap:anywhere }.peer small { display:none }
   .trust-grid { padding-block:24px; display:grid; grid-template-columns:1fr 1fr; gap:16px; }.trust-grid i { display:none; }
   .feature-section { padding-block: 96px 72px; }.section-intro { margin-bottom:38px }.section-intro h2,.security-copy h2,.release-copy h2 { font-size:40px }.feature-grid { grid-template-columns:1fr }.feature-card { min-height:330px; }
   .flow-section { padding-block:80px }.flow-grid { grid-template-columns:1fr }.flow-grid li { min-height:180px; padding:26px; }
   .security-section { padding-block:80px }.security-card { grid-template-columns:1fr; gap:38px; padding:32px 24px; }.security-copy .button { width:100%; }
   .truth-section { grid-template-columns:64px 1fr; gap:22px; padding-bottom:80px }.truth-mark { width:58px;height:58px }.truth-section h2 { font-size:32px }.truth-section > p { grid-column:1 / -1; padding:22px 0 0; border-left:0; border-top:1px solid var(--hairline) }
   .release-section { margin-bottom:80px; grid-template-columns:1fr }.release-copy { padding:42px 26px }.release-copy .button { width:100%; }.release-art { min-height:330px }
-  .site-footer { padding-top:64px }.footer-grid { grid-template-columns:1fr 1fr; gap:38px 24px }.footer-grid > div:first-child,.footer-note { grid-column:1 / -1 }.footer-bottom { align-items:flex-start; flex-direction:column; gap:8px; }
+  .site-footer { padding-block: 26px; }.footer-signature { max-width: 280px; font-size: 12px; }
 }
 
 @media (prefers-reduced-motion: reduce) {
