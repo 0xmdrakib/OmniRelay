@@ -880,7 +880,10 @@ test("two devices exchange, acknowledge and obtain LiveKit credentials", { skip:
 
   const revokeOutsider = await fetch(`${baseUrl}/v1/devices/session`, {
     method: "DELETE",
-    headers: auth(outsider)
+    headers: {
+      authorization: `Bearer ${outsider.token}`,
+      "x-device-id": outsider.deviceId
+    }
   });
   assert.equal(revokeOutsider.status, 204);
   const revokedSessionRequest = await fetch(`${baseUrl}/v1/mailbox?limit=1`, {
