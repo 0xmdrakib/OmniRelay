@@ -8,12 +8,16 @@ Thumbs.db
 **/build/
 local.properties
 .tmp_*/
+/DESIGN.md
+/design.md
 
 # Node/pnpm state
 **/node_modules/
 **/.pnpm-store/
 backend/node_modules.docker-broken/
 backend/dist/
+website/dist/
+website/.vercel/
 *.log
 
 # Runtime configuration and credentials

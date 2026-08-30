@@ -9,6 +9,7 @@ import android.content.Context
 import android.content.Intent
 import android.os.Build
 import android.util.Log
+import com.example.omnirelay.auth.FirebaseAccountSession
 import com.example.omnirelay.protocol.OmniFrame
 import com.example.omnirelay.routing.AdaptiveResourcePolicy.UserResourceTier
 import com.example.omnirelay.service.OmniRelayService
@@ -80,6 +81,7 @@ class OmniRelayBackgroundScanner : BroadcastReceiver() {
 
     override fun onReceive(context: Context, intent: Intent) {
         if (intent.action == ACTION_BLE_SCAN_RESULT) {
+            if (!FirebaseAccountSession.isSignedIn(context)) return
             val results: ArrayList<ScanResult>? = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
                 intent.getParcelableArrayListExtra(
                     BluetoothLeScanner.EXTRA_LIST_SCAN_RESULT,

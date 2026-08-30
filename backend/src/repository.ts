@@ -1,4 +1,5 @@
 import pg from "pg";
+import { isValidAccountUid } from "./account-auth.js";
 import { hashToken, tokenMatches } from "./identity.js";
 import {
   isCanonicalDeviceId,
@@ -14,6 +15,12 @@ export const MIN_ACTIVE_CALL_LEASE_SECONDS = 30;
 export const MAX_ACTIVE_CALL_LEASE_SECONDS = 300;
 const TERMINAL_CALL_RETENTION_SECONDS = 300;
 const MAX_REGISTRATION_CHALLENGES = 16;
+const MAX_ACCOUNT_REGISTRATION_CHALLENGES = 64;
+
+export type DeviceRegistrationResult =
+  | "registered"
+  | "signing_identity_mismatch"
+  | "account_mismatch";
 
 export type Device = {
   deviceId: string;
@@ -118,39 +125,62 @@ export class Repository {
   async saveRegistrationChallenge(
     challengeId: string,
     deviceId: string,
+    accountUid: string,
     publicKeyBase64: string,
     signingPublicKeyBase64: string,
     nonceBase64: string,
     x25519ProofBase64: string,
-    maxOutstanding: number
+    maxOutstanding: number,
+    maxOutstandingForAccount: number
   ): Promise<boolean> {
+    if (!isValidAccountUid(accountUid)) throw new Error("invalid account UID");
     if (!Number.isInteger(maxOutstanding) || maxOutstanding < 1 ||
         maxOutstanding > MAX_REGISTRATION_CHALLENGES) {
       throw new Error("maxOutstanding registration challenges is outside the supported range");
     }
+    if (!Number.isInteger(maxOutstandingForAccount) || maxOutstandingForAccount < 1 ||
+        maxOutstandingForAccount > MAX_ACCOUNT_REGISTRATION_CHALLENGES) {
+      throw new Error("maxOutstandingForAccount registration challenges is outside the supported range");
+    }
     const client = await this.pool.connect();
     try {
       await client.query("BEGIN");
+      await client.query("SELECT pg_advisory_xact_lock(hashtext($1))", [`account-registration:${accountUid}`]);
       await client.query("SELECT pg_advisory_xact_lock(hashtext($1))", [`registration:${deviceId}`]);
       await client.query(
-        "DELETE FROM registration_challenges WHERE device_id = $1 AND expires_at <= NOW()",
-        [deviceId]
+        `DELETE FROM registration_challenges
+         WHERE (device_id = $1 OR account_uid = $2) AND expires_at <= NOW()`,
+        [deviceId, accountUid]
       );
       const capacity = await client.query(
-        "SELECT COUNT(*)::integer AS count FROM registration_challenges WHERE device_id = $1",
-        [deviceId]
+        `SELECT
+           COUNT(*) FILTER (WHERE device_id = $1)::integer AS device_count,
+           COUNT(*) FILTER (WHERE account_uid = $2)::integer AS account_count
+         FROM registration_challenges
+         WHERE device_id = $1 OR account_uid = $2`,
+        [deviceId, accountUid]
       );
-      if ((capacity.rows[0]?.count ?? maxOutstanding) >= maxOutstanding) {
+      const row = capacity.rows[0];
+      if ((row?.device_count ?? maxOutstanding) >= maxOutstanding ||
+          (row?.account_count ?? maxOutstandingForAccount) >= maxOutstandingForAccount) {
         await client.query("ROLLBACK");
         return false;
       }
       await client.query(
         `INSERT INTO registration_challenges(
-           challenge_id, device_id, public_key_base64, signing_public_key_base64,
+           challenge_id, device_id, account_uid, public_key_base64, signing_public_key_base64,
            nonce_base64, x25519_proof_base64, expires_at
          )
-         VALUES ($1, $2, $3, $4, $5, $6, NOW() + INTERVAL '5 minutes')`,
-        [challengeId, deviceId, publicKeyBase64, signingPublicKeyBase64, nonceBase64, x25519ProofBase64]
+         VALUES ($1, $2, $3, $4, $5, $6, $7, NOW() + INTERVAL '5 minutes')`,
+        [
+          challengeId,
+          deviceId,
+          accountUid,
+          publicKeyBase64,
+          signingPublicKeyBase64,
+          nonceBase64,
+          x25519ProofBase64
+        ]
       );
       await client.query("COMMIT");
       return true;
@@ -163,19 +193,21 @@ export class Repository {
   }
 
   async registrationChallenge(challengeId: string, deviceId: string): Promise<{
+    accountUid: string;
     publicKeyBase64: string;
     signingPublicKeyBase64: string;
     nonceBase64: string;
     x25519ProofBase64: string;
   } | null> {
     const result = await this.pool.query(
-      `SELECT public_key_base64, signing_public_key_base64, nonce_base64, x25519_proof_base64
+      `SELECT account_uid, public_key_base64, signing_public_key_base64, nonce_base64, x25519_proof_base64
        FROM registration_challenges
        WHERE challenge_id = $1 AND device_id = $2 AND expires_at > NOW()`,
       [challengeId, deviceId]
     );
     const row = result.rows[0];
     return row ? {
+      accountUid: row.account_uid,
       publicKeyBase64: row.public_key_base64,
       signingPublicKeyBase64: row.signing_public_key_base64,
       nonceBase64: row.nonce_base64,
@@ -183,33 +215,78 @@ export class Repository {
     } : null;
   }
 
-  async consumeRegistrationChallenge(challengeId: string, deviceId: string): Promise<boolean> {
+  async consumeRegistrationChallenge(
+    challengeId: string,
+    deviceId: string,
+    accountUid: string
+  ): Promise<boolean> {
+    if (!isValidAccountUid(accountUid)) return false;
     const result = await this.pool.query(
       `DELETE FROM registration_challenges
-       WHERE challenge_id = $1 AND device_id = $2 AND expires_at > NOW()`,
-      [challengeId, deviceId]
+       WHERE challenge_id = $1 AND device_id = $2 AND account_uid = $3 AND expires_at > NOW()`,
+      [challengeId, deviceId, accountUid]
     );
     return result.rowCount === 1;
   }
 
   async registerOrRotate(
     deviceId: string,
+    accountUid: string,
     publicKeyBase64: string,
     signingPublicKeyBase64: string,
     token: string
-  ): Promise<boolean> {
-    const result = await this.pool.query(
-      `INSERT INTO devices(device_id, public_key_base64, signing_public_key_base64, token_hash)
-       VALUES ($1, $2, $3, $4)
-       ON CONFLICT (device_id) DO UPDATE SET
-         token_hash = EXCLUDED.token_hash,
-         token_expires_at = NOW() + INTERVAL '30 days',
-         last_seen_at = NOW()
-       WHERE devices.public_key_base64 = EXCLUDED.public_key_base64
-         AND devices.signing_public_key_base64 = EXCLUDED.signing_public_key_base64`,
-      [deviceId, publicKeyBase64, signingPublicKeyBase64, hashToken(token)]
-    );
-    return result.rowCount === 1;
+  ): Promise<DeviceRegistrationResult> {
+    if (!isValidAccountUid(accountUid)) throw new Error("invalid account UID");
+    const client = await this.pool.connect();
+    try {
+      await client.query("BEGIN");
+      await client.query("SELECT pg_advisory_xact_lock(hashtext($1))", [`registration:${deviceId}`]);
+      const existing = await client.query(
+        `SELECT public_key_base64, signing_public_key_base64, account_uid
+         FROM devices WHERE device_id = $1 FOR UPDATE`,
+        [deviceId]
+      );
+      const row = existing.rows[0];
+      if (!row) {
+        await client.query(
+          `INSERT INTO devices(
+             device_id, account_uid, public_key_base64, signing_public_key_base64, token_hash
+           ) VALUES ($1, $2, $3, $4, $5)`,
+          [deviceId, accountUid, publicKeyBase64, signingPublicKeyBase64, hashToken(token)]
+        );
+      } else {
+        if (row.public_key_base64 !== publicKeyBase64 ||
+            row.signing_public_key_base64 !== signingPublicKeyBase64) {
+          await client.query("ROLLBACK");
+          return "signing_identity_mismatch";
+        }
+        if (row.account_uid !== null && row.account_uid !== accountUid) {
+          await client.query("ROLLBACK");
+          return "account_mismatch";
+        }
+        await client.query(
+          `UPDATE devices SET
+             account_uid = COALESCE(account_uid, $2),
+             token_hash = $3,
+             token_expires_at = NOW() + INTERVAL '30 days',
+             last_seen_at = NOW()
+           WHERE device_id = $1`,
+          [deviceId, accountUid, hashToken(token)]
+        );
+      }
+      await client.query("COMMIT");
+      return "registered";
+    } catch (error) {
+      await client.query("ROLLBACK").catch(() => undefined);
+      throw error;
+    } finally {
+      client.release();
+    }
+  }
+
+  async accountUidForDevice(deviceId: string): Promise<string | null> {
+    const result = await this.pool.query("SELECT account_uid FROM devices WHERE device_id = $1", [deviceId]);
+    return result.rows[0]?.account_uid ?? null;
   }
 
   async authenticate(deviceId: string, token: string): Promise<Device | null> {
@@ -235,6 +312,15 @@ export class Repository {
 
   async setFcmToken(deviceId: string, fcmToken: string | null): Promise<void> {
     await this.pool.query("UPDATE devices SET fcm_token = $2 WHERE device_id = $1", [deviceId, fcmToken]);
+  }
+
+  async revokeSession(deviceId: string): Promise<void> {
+    await this.pool.query(
+      `UPDATE devices
+       SET token_expires_at = NOW(), fcm_token = NULL, last_seen_at = NOW()
+       WHERE device_id = $1`,
+      [deviceId]
+    );
   }
 
   async fcmTokenFor(deviceId: string): Promise<string | null> {

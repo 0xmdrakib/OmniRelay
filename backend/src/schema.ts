@@ -3,22 +3,28 @@ CREATE TABLE IF NOT EXISTS devices (
   device_id TEXT PRIMARY KEY,
   public_key_base64 TEXT UNIQUE NOT NULL,
   signing_public_key_base64 TEXT NOT NULL,
+  account_uid TEXT,
   token_hash BYTEA NOT NULL,
   token_expires_at TIMESTAMPTZ NOT NULL DEFAULT (NOW() + INTERVAL '30 days'),
   fcm_token TEXT,
   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-  last_seen_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+  last_seen_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  CONSTRAINT devices_account_uid_bounds
+    CHECK (account_uid IS NULL OR char_length(account_uid) BETWEEN 1 AND 128)
 );
 
 CREATE TABLE IF NOT EXISTS registration_challenges (
   challenge_id UUID PRIMARY KEY,
   device_id TEXT NOT NULL,
+  account_uid TEXT NOT NULL,
   public_key_base64 TEXT NOT NULL,
   signing_public_key_base64 TEXT NOT NULL,
   nonce_base64 TEXT NOT NULL,
   x25519_proof_base64 TEXT,
   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-  expires_at TIMESTAMPTZ NOT NULL
+  expires_at TIMESTAMPTZ NOT NULL,
+  CONSTRAINT registration_challenges_account_uid_bounds
+    CHECK (char_length(account_uid) BETWEEN 1 AND 128)
 );
 
 CREATE TABLE IF NOT EXISTS inbound_routes (
@@ -55,11 +61,38 @@ CREATE TABLE IF NOT EXISTS envelopes (
 );
 
 ALTER TABLE envelopes ADD COLUMN IF NOT EXISTS rejected_at TIMESTAMPTZ;
+ALTER TABLE devices ADD COLUMN IF NOT EXISTS account_uid TEXT;
+ALTER TABLE registration_challenges ADD COLUMN IF NOT EXISTS account_uid TEXT;
 ALTER TABLE registration_challenges ADD COLUMN IF NOT EXISTS x25519_proof_base64 TEXT;
 ALTER TABLE registration_challenges ADD COLUMN IF NOT EXISTS challenge_id UUID;
 ALTER TABLE registration_challenges ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ NOT NULL DEFAULT NOW();
 UPDATE registration_challenges SET challenge_id = gen_random_uuid() WHERE challenge_id IS NULL;
 ALTER TABLE registration_challenges ALTER COLUMN challenge_id SET NOT NULL;
+
+-- Challenges issued before account authentication cannot be upgraded safely.
+DELETE FROM registration_challenges WHERE account_uid IS NULL;
+ALTER TABLE registration_challenges ALTER COLUMN account_uid SET NOT NULL;
+
+DO $account_constraints$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_constraint
+    WHERE conrelid = 'devices'::regclass AND conname = 'devices_account_uid_bounds'
+  ) THEN
+    ALTER TABLE devices ADD CONSTRAINT devices_account_uid_bounds
+      CHECK (account_uid IS NULL OR char_length(account_uid) BETWEEN 1 AND 128);
+  END IF;
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_constraint
+    WHERE conrelid = 'registration_challenges'::regclass
+      AND conname = 'registration_challenges_account_uid_bounds'
+  ) THEN
+    ALTER TABLE registration_challenges
+      ADD CONSTRAINT registration_challenges_account_uid_bounds
+      CHECK (char_length(account_uid) BETWEEN 1 AND 128);
+  END IF;
+END
+$account_constraints$;
 
 DO $migration$
 DECLARE
@@ -107,6 +140,10 @@ CREATE INDEX IF NOT EXISTS registration_challenges_expiry_idx
   ON registration_challenges(expires_at);
 CREATE INDEX IF NOT EXISTS registration_challenges_device_idx
   ON registration_challenges(device_id, created_at);
+CREATE INDEX IF NOT EXISTS registration_challenges_account_idx
+  ON registration_challenges(account_uid, created_at);
+CREATE INDEX IF NOT EXISTS devices_account_uid_idx
+  ON devices(account_uid) WHERE account_uid IS NOT NULL;
 
 ALTER TABLE devices ADD COLUMN IF NOT EXISTS token_expires_at TIMESTAMPTZ;
 UPDATE devices SET token_expires_at = NOW() + INTERVAL '30 days' WHERE token_expires_at IS NULL;

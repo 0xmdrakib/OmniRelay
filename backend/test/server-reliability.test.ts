@@ -23,6 +23,7 @@ class FakeRepository {
   closeCalls = 0;
   readonly callTtls: number[] = [];
   readonly envelopeTtls: number[] = [];
+  readonly revokedDeviceIds: string[] = [];
   readonly senderPublicKey = Buffer.alloc(32, 7).toString("base64");
   readonly recipientPublicKey = Buffer.alloc(32, 9).toString("base64");
   healthHandler: () => Promise<void> = async () => undefined;
@@ -61,6 +62,10 @@ class FakeRepository {
 
   async routeAuthorized(): Promise<boolean> {
     return true;
+  }
+
+  async revokeSession(deviceId: string): Promise<void> {
+    this.revokedDeviceIds.push(deviceId);
   }
 
   async createCallWithEnvelope(_input: unknown, ttlSeconds: number) {
@@ -114,6 +119,24 @@ test("overload returns retryable 503 and releases the request slot", async () =>
   assert.equal((await app.inject({ method: "GET", url: "/healthz" })).statusCode, 200);
   await app.close();
   assert.equal(fake.closeCalls, 1);
+});
+
+test("authenticated sign-out revokes the server-side device session", async () => {
+  const fake = new FakeRepository();
+  const app = await buildServer(repository(fake), {
+    logger: false,
+    cleanupIntervalMs: 60_000,
+    pushGateway: disabledPush
+  });
+  const deviceId = "a".repeat(64);
+  const response = await app.inject({
+    method: "DELETE",
+    url: "/v1/devices/session",
+    headers: { authorization: "Bearer test", "x-device-id": deviceId }
+  });
+  assert.equal(response.statusCode, 204);
+  assert.deepEqual(fake.revokedDeviceIds, [deviceId]);
+  await app.close();
 });
 
 test("cleanup never overlaps and shutdown waits before closing PostgreSQL", async () => {

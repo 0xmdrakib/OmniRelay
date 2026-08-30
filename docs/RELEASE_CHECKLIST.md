@@ -6,16 +6,18 @@
 - [ ] Create and securely back up the release keystore and recovery material.
 - [ ] Update `versionCode` and `versionName`.
 - [ ] Confirm final app name, icons, privacy policy, and support contact.
+- [ ] Enable Google sign-in, verify OAuth consent branding, register debug/release
+      certificate fingerprints, and test account recovery.
 
 ## Infrastructure
 
 - [ ] Provision a maintained public Linux host with automated security updates.
 - [ ] Point relay and LiveKit DNS names to the host.
 - [ ] Generate `.env` and LiveKit config with `initialize-production.ps1`.
-- [ ] Configure Firebase Cloud Messaging without committing either client or
-      service-account configuration.
+- [ ] Configure Firebase Authentication and Cloud Messaging without committing
+      client OAuth values or service-account configuration.
 - [ ] Restrict the host firewall to documented TCP/UDP ports.
-- [ ] Start with `start-production.ps1` and verify Caddy TLS and `/healthz`.
+- [ ] Start with `start-production.ps1` and verify Caddy TLS, `/healthz`, and `/readyz`.
 - [ ] Configure encrypted PostgreSQL backups and test a restore.
 - [ ] Configure uptime, disk, certificate, container, and error monitoring.
 - [ ] Load-test the intended small-host profile, record p95 latency and database
@@ -47,6 +49,10 @@
 - [ ] Verify Android 8/API 26 and Android 13+/API 33 crypto initialization.
 - [ ] Corrupt a test identity wrapper and confirm the app fails closed and offers
       recovery guidance without silently creating a new identity.
+- [ ] Verify first sign-in, automatic returning-user sign-in, cancellation,
+      sign-out, token refresh, expired 30-day device sessions, and re-registration.
+- [ ] Prove a second Google account cannot claim an already-bound device identity
+      and that a same-account cryptographic re-registration rotates its session.
 
 ## Security gate
 
@@ -65,6 +71,11 @@
 
 ## Distribution
 
+- [ ] Deploy only `website/` as the Vercel Root Directory and inspect the public
+      bundle for application/backend source or secrets.
+- [ ] Set the final canonical/social URL and verify the generated preview card.
+- [ ] Publish the signed APK on a publicly accessible GitHub Release; Releases in
+      a private repository cannot serve anonymous website visitors.
 - [ ] Build a signed AAB from a clean checkout and pinned commit.
 - [ ] Verify signing certificate fingerprints and archive the mapping file.
 - [ ] Complete Play Console Data Safety, foreground-service, full-screen-intent,

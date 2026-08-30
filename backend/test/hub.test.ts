@@ -64,3 +64,22 @@ test("hub evicts old per-device sessions and slow consumers", () => {
   assert.equal(hub.size(), 1);
   assert.equal(newest.sent.length, 1);
 });
+
+test("disconnecting a device closes every socket and releases global capacity once", () => {
+  const hub = new RealtimeHub(2, 2, 1_024);
+  const first = socket();
+  const second = socket();
+  hub.add("device", asWebSocket(first));
+  hub.add("device", asWebSocket(second));
+
+  hub.disconnectDevice("device");
+  assert.equal(first.closed[0]?.code, 1000);
+  assert.equal(second.closed[0]?.reason, "session revoked");
+  assert.equal(hub.size(), 0);
+
+  hub.remove("device", asWebSocket(first));
+  assert.equal(hub.size(), 0);
+  assert.equal(hub.add("new-a", asWebSocket(socket())), true);
+  assert.equal(hub.add("new-b", asWebSocket(socket())), true);
+  assert.equal(hub.size(), 2);
+});

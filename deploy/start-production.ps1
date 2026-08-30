@@ -26,14 +26,16 @@ try {
     $healthy = $false
     do {
         try {
-            $health = Invoke-RestMethod "http://127.0.0.1:8080/healthz" -TimeoutSec 3
-            if ($health.status -eq "ok") { $healthy = $true; break }
+            $health = Invoke-RestMethod "http://127.0.0.1:8080/readyz" -TimeoutSec 3
+            if ($health.status -eq "ready") { $healthy = $true; break }
         } catch {
             Start-Sleep -Seconds 2
         }
     } while ((Get-Date) -lt $deadline)
 
-    if (-not $healthy) { throw "Relay did not become healthy within two minutes." }
+    if (-not $healthy) {
+        throw "Relay did not become production-ready within two minutes. Check PostgreSQL and Firebase Admin configuration."
+    }
     docker compose --profile production ps
     Write-Output "OmniRelay production services are healthy."
 } finally {

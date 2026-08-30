@@ -60,11 +60,20 @@ class InternetRelayClient(context: Context) {
         identity: CryptoEngine.KeyPairData,
         signingIdentity: CryptoEngine.SigningKeyPairData,
         fcmToken: String?,
-        authorizedPeers: List<ByteArray>
+        authorizedPeers: List<ByteArray>,
+        accountUid: String,
+        accountIdToken: String
     ): RelayCredentials = registrationMutex.withLock {
         var credentials = credentialsStore.load()
+        if (credentials != null && credentials.accountUid != accountUid) {
+            closeRealtime()
+            credentialsStore.clear()
+            syncedRouteFingerprint = null
+            lastRouteSyncAtMillis = 0L
+            credentials = null
+        }
         if (credentials == null) {
-            credentials = register(identity, signingIdentity, fcmToken)
+            credentials = register(identity, signingIdentity, fcmToken, accountUid, accountIdToken)
         } else if (fcmToken != null) {
             runCatching { updatePushToken(fcmToken) }
         }
@@ -75,8 +84,12 @@ class InternetRelayClient(context: Context) {
     private suspend fun register(
         identity: CryptoEngine.KeyPairData,
         signingIdentity: CryptoEngine.SigningKeyPairData,
-        fcmToken: String?
+        fcmToken: String?,
+        accountUid: String,
+        accountIdToken: String
     ): RelayCredentials {
+        require(accountUid.length in 1..128) { "Invalid account UID" }
+        require(accountIdToken.length in 100..16_384) { "Invalid Firebase ID token" }
         val signingPublicKeyBase64 = android.util.Base64.encodeToString(
             signingIdentity.publicKeyDer,
             android.util.Base64.NO_WRAP
@@ -88,6 +101,7 @@ class InternetRelayClient(context: Context) {
         val challengeBody = json.encodeToString(ChallengeRequest(publicKeyBase64, signingPublicKeyBase64))
         val challengeRequest = Request.Builder()
             .url("$baseUrl/v1/devices/challenge")
+            .header("Authorization", "Bearer $accountIdToken")
             .post(challengeBody.toRequestBody(mediaType))
             .build()
         val challenge = execute(challengeRequest).use { response ->
@@ -122,6 +136,7 @@ class InternetRelayClient(context: Context) {
         ))
         val request = Request.Builder()
             .url("$baseUrl/v1/devices/register")
+            .header("Authorization", "Bearer $accountIdToken")
             .post(body.toRequestBody(mediaType))
             .build()
         val responseText = execute(request).use { response ->
@@ -129,7 +144,7 @@ class InternetRelayClient(context: Context) {
             response.body.string()
         }
         return json.decodeFromString<RegisterResponse>(responseText).let {
-            RelayCredentials(it.deviceId, it.token).also(credentialsStore::save)
+            RelayCredentials(it.deviceId, it.token, accountUid).also(credentialsStore::save)
         }
     }
 
@@ -189,6 +204,16 @@ class InternetRelayClient(context: Context) {
         val body = json.encodeToString(PushTokenRequest(fcmToken))
         execute(authenticatedRequest("$baseUrl/v1/devices/push-token")
             .put(body.toRequestBody(mediaType)).build()).use { requireSuccess(it) }
+    }
+
+    suspend fun revokeSession() {
+        execute(authenticatedRequest("$baseUrl/v1/devices/session").delete().build()).use { response ->
+            requireSuccess(response)
+        }
+        closeRealtime()
+        credentialsStore.clear()
+        syncedRouteFingerprint = null
+        lastRouteSyncAtMillis = 0L
     }
 
     suspend fun sendEnvelope(envelope: SendEnvelopeRequest) {

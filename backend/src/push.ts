@@ -1,5 +1,6 @@
-import { cert, getApps, initializeApp } from "firebase-admin/app";
+import type { App } from "firebase-admin/app";
 import { getMessaging } from "firebase-admin/messaging";
+import { getOrCreateFirebaseAdminApp } from "./firebase-admin.js";
 
 export interface PushGateway {
   readonly enabled: boolean;
@@ -17,23 +18,19 @@ class DisabledPushGateway implements PushGateway {
   readonly enabled = false;
 
   async sendWake(): Promise<void> {
-    // WebSocket and mailbox polling remain fully functional without Firebase.
+    // Existing device sessions can still poll while valid; new account-bound
+    // registrations fail closed when the shared Firebase Admin app is absent.
   }
 }
 
 class FirebasePushGateway implements PushGateway {
   readonly enabled = true;
 
-  constructor(serviceAccountJson: string) {
-    if (getApps().length === 0) {
-      const serviceAccount = JSON.parse(serviceAccountJson);
-      initializeApp({ credential: cert(serviceAccount) });
-    }
-  }
+  constructor(private readonly app: App) {}
 
   async sendWake(token: string, envelopeId: string, kind: "message" | "call"): Promise<void> {
     try {
-      await getMessaging().send({
+      await getMessaging(this.app).send({
         token,
         data: { type: "mailbox_changed", envelope_id: envelopeId, kind },
         android: {
@@ -53,5 +50,6 @@ class FirebasePushGateway implements PushGateway {
 }
 
 export function createPushGateway(serviceAccountJson?: string): PushGateway {
-  return serviceAccountJson ? new FirebasePushGateway(serviceAccountJson) : new DisabledPushGateway();
+  const app = getOrCreateFirebaseAdminApp(serviceAccountJson);
+  return app ? new FirebasePushGateway(app) : new DisabledPushGateway();
 }

@@ -10,6 +10,7 @@ import androidx.work.OneTimeWorkRequestBuilder
 import androidx.work.OutOfQuotaPolicy
 import androidx.work.WorkManager
 import com.example.omnirelay.service.OmniRelayService
+import com.example.omnirelay.auth.FirebaseAccountSession
 import com.google.firebase.messaging.FirebaseMessagingService
 import com.google.firebase.messaging.RemoteMessage
 
@@ -29,6 +30,10 @@ class OmniFirebaseMessagingService : FirebaseMessagingService() {
     }
 
     private fun wakeService(action: String, token: String?) {
+        if (!FirebaseAccountSession.isSignedIn(this)) {
+            Log.i("OmniFCM", "Ignoring relay wake while no Google account is signed in")
+            return
+        }
         val intent = Intent(this, OmniRelayService::class.java).apply {
             this.action = action
             token?.let { putExtra(OmniRelayService.EXTRA_PUSH_TOKEN, it) }

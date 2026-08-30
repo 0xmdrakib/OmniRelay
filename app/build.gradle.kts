@@ -27,6 +27,7 @@ android {
         buildConfigField("String", "FIREBASE_APP_ID", providers.gradleProperty("OMNIRELAY_FIREBASE_APP_ID").orElse("").get().asBuildConfigString())
         buildConfigField("String", "FIREBASE_PROJECT_ID", providers.gradleProperty("OMNIRELAY_FIREBASE_PROJECT_ID").orElse("").get().asBuildConfigString())
         buildConfigField("String", "FIREBASE_SENDER_ID", providers.gradleProperty("OMNIRELAY_FIREBASE_SENDER_ID").orElse("").get().asBuildConfigString())
+        buildConfigField("String", "GOOGLE_WEB_CLIENT_ID", providers.gradleProperty("OMNIRELAY_GOOGLE_WEB_CLIENT_ID").orElse("").get().asBuildConfigString())
     }
 
     val releaseKeystore = providers.gradleProperty("OMNIRELAY_KEYSTORE_FILE").orNull
@@ -104,6 +105,10 @@ dependencies {
   // Internet wake-up and professional VoIP media/platform integration
   implementation(platform(libs.firebase.bom))
   implementation(libs.firebase.messaging)
+  implementation(libs.firebase.auth)
+  implementation(libs.androidx.credentials)
+  implementation(libs.androidx.credentials.play.services.auth)
+  implementation(libs.googleid)
   implementation(libs.livekit.android)
   implementation(libs.androidx.core.telecom)
 }

@@ -11,24 +11,68 @@ import {
   type KeyObject
 } from "node:crypto";
 import test from "node:test";
+import pg from "pg";
 import WebSocket from "ws";
-import { registrationProof, registrationX25519Proof } from "../src/identity.js";
+import type { AccountTokenVerifier } from "../src/account-auth.js";
+import { hashToken, registrationProof, registrationX25519Proof } from "../src/identity.js";
+import type { PushGateway } from "../src/push.js";
+import { Repository } from "../src/repository.js";
+import { buildServer } from "../src/server.js";
 
 const integrationBaseUrl = process.env.INTEGRATION_BASE_URL;
-const baseUrl = integrationBaseUrl ?? "http://127.0.0.1:0";
+let baseUrl = "http://127.0.0.1:0";
+const { Pool } = pg;
 
-type RegisteredDevice = {
-  deviceId: string;
-  token: string;
+const accountAUid = "integration-account-a";
+const accountBUid = "integration-account-b";
+const accountCUid = "integration-account-c";
+const accountAToken = "firebase-test-id-token-for-integration-account-a";
+const accountBToken = "firebase-test-id-token-for-integration-account-b";
+const accountCToken = "firebase-test-id-token-for-integration-account-c";
+const accountByToken = new Map([
+  [accountAToken, accountAUid],
+  [accountBToken, accountBUid],
+  [accountCToken, accountCUid]
+]);
+
+const integrationAccountVerifier: AccountTokenVerifier = {
+  configured: true,
+  async verifyIdToken(token: string): Promise<string> {
+    const uid = accountByToken.get(token);
+    if (!uid) throw new Error("invalid injected integration token");
+    return uid;
+  }
+};
+
+const disabledPush: PushGateway = {
+  enabled: false,
+  async sendWake() {}
+};
+
+type DeviceIdentity = {
   publicKeyBase64: string;
   encryptionPrivateKey: KeyObject;
+  signingPublicKeyBase64: string;
+  signingPrivateKey: KeyObject;
+};
+
+type RegisteredDevice = DeviceIdentity & {
+  deviceId: string;
+  token: string;
+};
+
+type RegistrationChallenge = {
+  challengeId: string;
+  deviceId: string;
+  nonceBase64: string;
+  serverEphemeralPublicKeyBase64: string;
 };
 
 function base64UrlToBuffer(value: string): Buffer {
   return Buffer.from(value.replace(/-/g, "+").replace(/_/g, "/"), "base64");
 }
 
-async function registerDevice(): Promise<RegisteredDevice> {
+function createDeviceIdentity(): DeviceIdentity {
   const encryption = generateKeyPairSync("x25519");
   const signing = generateKeyPairSync("ed25519");
   const publicKey = encryption.publicKey.export({ format: "jwk" });
@@ -38,28 +82,37 @@ async function registerDevice(): Promise<RegisteredDevice> {
   const signingPublicKeyBase64 = signing.publicKey
     .export({ format: "der", type: "spki" })
     .toString("base64");
-  const challengeRequest = () => fetch(`${baseUrl}/v1/devices/challenge`, {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify({ publicKeyBase64, signingPublicKeyBase64 })
-  });
-  const challengeResponse = await challengeRequest();
-  assert.equal(challengeResponse.status, 200);
-  const challenge = await challengeResponse.json() as {
-    challengeId: string;
-    deviceId: string;
-    nonceBase64: string;
-    serverEphemeralPublicKeyBase64: string;
+  return {
+    publicKeyBase64,
+    encryptionPrivateKey: encryption.privateKey,
+    signingPublicKeyBase64,
+    signingPrivateKey: signing.privateKey
   };
-  const parallelChallengeResponse = await challengeRequest();
-  assert.equal(parallelChallengeResponse.status, 200);
-  const parallelChallenge = await parallelChallengeResponse.json() as { challengeId: string };
-  assert.notEqual(parallelChallenge.challengeId, challenge.challengeId);
-  assert.equal(challenge.deviceId, createHash("sha256").update(Buffer.from(publicKeyBase64, "base64")).digest("hex"));
+}
+
+function accountHeaders(accountToken: string): Record<string, string> {
+  return {
+    authorization: `Bearer ${accountToken}`,
+    "content-type": "application/json"
+  };
+}
+
+function requestChallenge(identity: DeviceIdentity, accountToken: string): Promise<Response> {
+  return fetch(`${baseUrl}/v1/devices/challenge`, {
+    method: "POST",
+    headers: accountHeaders(accountToken),
+    body: JSON.stringify({
+      publicKeyBase64: identity.publicKeyBase64,
+      signingPublicKeyBase64: identity.signingPublicKeyBase64
+    })
+  });
+}
+
+function registrationPayload(identity: DeviceIdentity, challenge: RegistrationChallenge) {
   const signatureBase64 = sign(
     null,
     registrationProof(challenge.deviceId, challenge.nonceBase64),
-    signing.privateKey
+    identity.signingPrivateKey
   ).toString("base64");
   const serverPublicKey = createPublicKey({
     key: {
@@ -70,7 +123,7 @@ async function registerDevice(): Promise<RegisteredDevice> {
     format: "jwk"
   });
   const rawSharedSecret = diffieHellman({
-    privateKey: encryption.privateKey,
+    privateKey: identity.encryptionPrivateKey,
     publicKey: serverPublicKey
   });
   const pairSharedSecret = Buffer.from(hkdfSync(
@@ -80,37 +133,64 @@ async function registerDevice(): Promise<RegisteredDevice> {
     Buffer.from("OmniRelay/X25519/AES-256-GCM/v1", "utf8"),
     32
   ));
-  const x25519ProofBase64 = registrationX25519Proof(
-    pairSharedSecret,
-    challenge.deviceId,
-    challenge.nonceBase64,
-    signingPublicKeyBase64
-  ).toString("base64");
-  const registrationPayload = {
+  return {
     challengeId: challenge.challengeId,
-    publicKeyBase64,
-    signingPublicKeyBase64,
+    publicKeyBase64: identity.publicKeyBase64,
+    signingPublicKeyBase64: identity.signingPublicKeyBase64,
     nonceBase64: challenge.nonceBase64,
     signatureBase64,
-    x25519ProofBase64
+    x25519ProofBase64: registrationX25519Proof(
+      pairSharedSecret,
+      challenge.deviceId,
+      challenge.nonceBase64,
+      identity.signingPublicKeyBase64
+    ).toString("base64")
   };
-  const invalidProof = await fetch(`${baseUrl}/v1/devices/register`, {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify({
-      ...registrationPayload,
-      x25519ProofBase64: Buffer.alloc(32).toString("base64")
-    })
-  });
-  assert.equal(invalidProof.status, 401);
+}
+
+async function registerIdentity(
+  identity: DeviceIdentity,
+  accountToken: string,
+  exerciseProofRejection = false
+): Promise<RegisteredDevice> {
+  const challengeResponse = await requestChallenge(identity, accountToken);
+  assert.equal(challengeResponse.status, 200);
+  const challenge = await challengeResponse.json() as RegistrationChallenge;
+  assert.equal(
+    challenge.deviceId,
+    createHash("sha256").update(Buffer.from(identity.publicKeyBase64, "base64")).digest("hex")
+  );
+  const payload = registrationPayload(identity, challenge);
+  if (exerciseProofRejection) {
+    const parallelChallengeResponse = await requestChallenge(identity, accountToken);
+    assert.equal(parallelChallengeResponse.status, 200);
+    const parallelChallenge = await parallelChallengeResponse.json() as { challengeId: string };
+    assert.notEqual(parallelChallenge.challengeId, challenge.challengeId);
+    const invalidProof = await fetch(`${baseUrl}/v1/devices/register`, {
+      method: "POST",
+      headers: accountHeaders(accountToken),
+      body: JSON.stringify({
+        ...payload,
+        x25519ProofBase64: Buffer.alloc(32).toString("base64")
+      })
+    });
+    assert.equal(invalidProof.status, 401);
+  }
   const response = await fetch(`${baseUrl}/v1/devices/register`, {
     method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify(registrationPayload)
+    headers: accountHeaders(accountToken),
+    body: JSON.stringify(payload)
   });
   assert.equal(response.status, 201);
   const registered = await response.json() as { deviceId: string; token: string };
-  return { ...registered, publicKeyBase64, encryptionPrivateKey: encryption.privateKey };
+  return { ...identity, ...registered };
+}
+
+async function registerDevice(
+  accountToken: string,
+  exerciseProofRejection = false
+): Promise<RegisteredDevice> {
+  return registerIdentity(createDeviceIdentity(), accountToken, exerciseProofRejection);
 }
 
 function auth(device: RegisteredDevice): Record<string, string> {
@@ -207,13 +287,115 @@ function frame(
 }
 
 test("two devices exchange, acknowledge and obtain LiveKit credentials", { skip: !integrationBaseUrl }, async (t) => {
-  const sockets: WebSocket[] = [];
-  t.after(() => {
-    for (const socket of sockets) socket.terminate();
+  const databaseUrl = process.env.DATABASE_URL;
+  if (!databaseUrl) throw new Error("DATABASE_URL is required for integration tests");
+  const repository = new Repository(databaseUrl);
+  await repository.migrate();
+  const app = await buildServer(repository, {
+    logger: false,
+    cleanupIntervalMs: 60_000,
+    pushGateway: disabledPush,
+    accountTokenVerifier: integrationAccountVerifier
   });
-  const sender = await registerDevice();
-  const receiver = await registerDevice();
-  const outsider = await registerDevice();
+  await app.listen({ host: "127.0.0.1", port: 0 });
+  const address = app.server.address();
+  if (!address || typeof address === "string") throw new Error("integration server did not bind a TCP port");
+  baseUrl = `http://127.0.0.1:${address.port}`;
+  const database = new Pool({ connectionString: databaseUrl, max: 1 });
+  const sockets: WebSocket[] = [];
+  t.after(async () => {
+    for (const socket of sockets) socket.terminate();
+    await database.end();
+    await app.close();
+  });
+
+  const authProbeIdentity = createDeviceIdentity();
+  const missingAccountToken = await fetch(`${baseUrl}/v1/devices/challenge`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      publicKeyBase64: authProbeIdentity.publicKeyBase64,
+      signingPublicKeyBase64: authProbeIdentity.signingPublicKeyBase64
+    })
+  });
+  assert.equal(missingAccountToken.status, 401);
+  const invalidAccountToken = await requestChallenge(authProbeIdentity, "invalid-firebase-id-token");
+  assert.equal(invalidAccountToken.status, 401);
+
+  const sender = await registerDevice(accountAToken, true);
+  const receiver = await registerDevice(accountBToken);
+  const outsider = await registerDevice(accountCToken);
+
+  const oldSenderSessionToken = sender.token;
+  const rotationChallengeResponse = await requestChallenge(sender, accountAToken);
+  assert.equal(rotationChallengeResponse.status, 200);
+  const rotationChallenge = await rotationChallengeResponse.json() as RegistrationChallenge;
+  const rotationPayload = registrationPayload(sender, rotationChallenge);
+  const wrongAccountCompletion = await fetch(`${baseUrl}/v1/devices/register`, {
+    method: "POST",
+    headers: accountHeaders(accountBToken),
+    body: JSON.stringify(rotationPayload)
+  });
+  assert.equal(wrongAccountCompletion.status, 401);
+  const rotationResponse = await fetch(`${baseUrl}/v1/devices/register`, {
+    method: "POST",
+    headers: accountHeaders(accountAToken),
+    body: JSON.stringify(rotationPayload)
+  });
+  assert.equal(rotationResponse.status, 201);
+  const rotated = await rotationResponse.json() as { deviceId: string; token: string };
+  assert.equal(rotated.deviceId, sender.deviceId);
+  assert.notEqual(rotated.token, oldSenderSessionToken);
+  sender.token = rotated.token;
+  const oldSessionRejected = await fetch(`${baseUrl}/v1/devices/push-token`, {
+    method: "PUT",
+    headers: {
+      authorization: `Bearer ${oldSenderSessionToken}`,
+      "x-device-id": sender.deviceId,
+      "content-type": "application/json"
+    },
+    body: JSON.stringify({ fcmToken: null })
+  });
+  assert.equal(oldSessionRejected.status, 401);
+  const rotatedSessionAccepted = await fetch(`${baseUrl}/v1/devices/push-token`, {
+    method: "PUT",
+    headers: auth(sender),
+    body: JSON.stringify({ fcmToken: null })
+  });
+  assert.equal(rotatedSessionAccepted.status, 204);
+
+  const crossAccountTakeover = await requestChallenge(sender, accountBToken);
+  assert.equal(crossAccountTakeover.status, 409);
+  assert.deepEqual(await crossAccountTakeover.json(), { error: "device_account_mismatch" });
+  const senderBinding = await database.query(
+    "SELECT account_uid FROM devices WHERE device_id = $1",
+    [sender.deviceId]
+  );
+  assert.equal(senderBinding.rows[0]?.account_uid, accountAUid);
+
+  const legacyIdentity = createDeviceIdentity();
+  const legacyDeviceId = createHash("sha256")
+    .update(Buffer.from(legacyIdentity.publicKeyBase64, "base64"))
+    .digest("hex");
+  await database.query(
+    `INSERT INTO devices(
+       device_id, public_key_base64, signing_public_key_base64, token_hash, account_uid
+     ) VALUES ($1, $2, $3, $4, NULL)`,
+    [
+      legacyDeviceId,
+      legacyIdentity.publicKeyBase64,
+      legacyIdentity.signingPublicKeyBase64,
+      hashToken("legacy-device-session-token")
+    ]
+  );
+  const migratedLegacyDevice = await registerIdentity(legacyIdentity, accountCToken);
+  assert.equal(migratedLegacyDevice.deviceId, legacyDeviceId);
+  const migratedBinding = await database.query(
+    "SELECT account_uid FROM devices WHERE device_id = $1",
+    [legacyDeviceId]
+  );
+  assert.equal(migratedBinding.rows[0]?.account_uid, accountCUid);
+
   const senderToReceiverRoute = backendRouteToken(sender, receiver);
   const receiverToSenderRoute = backendRouteToken(receiver, sender);
   const outsiderToReceiverRoute = backendRouteToken(outsider, receiver);
@@ -253,7 +435,7 @@ test("two devices exchange, acknowledge and obtain LiveKit credentials", { skip:
     .toString("base64");
   const signingKeyReplacement = await fetch(`${baseUrl}/v1/devices/challenge`, {
     method: "POST",
-    headers: { "content-type": "application/json" },
+    headers: accountHeaders(accountAToken),
     body: JSON.stringify({
       publicKeyBase64: sender.publicKeyBase64,
       signingPublicKeyBase64: replacementSigningKey
@@ -570,8 +752,8 @@ test("two devices exchange, acknowledge and obtain LiveKit credentials", { skip:
     204
   );
 
-  const quotaCaller = await registerDevice();
-  const quotaCallee = await registerDevice();
+  const quotaCaller = await registerDevice(accountAToken);
+  const quotaCallee = await registerDevice(accountBToken);
   const quotaCallerToCallee = backendRouteToken(quotaCaller, quotaCallee);
   const quotaCalleeToCaller = backendRouteToken(quotaCallee, quotaCaller);
   assert.equal(
@@ -683,16 +865,33 @@ test("two devices exchange, acknowledge and obtain LiveKit credentials", { skip:
   for (let attempt = 0; attempt < 4; attempt += 1) {
     const challenge = await fetch(`${baseUrl}/v1/devices/challenge`, {
       method: "POST",
-      headers: { "content-type": "application/json" },
+      headers: accountHeaders(accountCToken),
       body: JSON.stringify(limitedChallengeBody)
     });
     assert.equal(challenge.status, 200);
   }
   const challengeLimit = await fetch(`${baseUrl}/v1/devices/challenge`, {
     method: "POST",
-    headers: { "content-type": "application/json" },
+    headers: accountHeaders(accountCToken),
     body: JSON.stringify(limitedChallengeBody)
   });
   assert.equal(challengeLimit.status, 429);
   assert.equal(challengeLimit.headers.get("retry-after"), "300");
+
+  const revokeOutsider = await fetch(`${baseUrl}/v1/devices/session`, {
+    method: "DELETE",
+    headers: auth(outsider)
+  });
+  assert.equal(revokeOutsider.status, 204);
+  const revokedSessionRequest = await fetch(`${baseUrl}/v1/mailbox?limit=1`, {
+    headers: auth(outsider)
+  });
+  assert.equal(revokedSessionRequest.status, 401);
+  const revokedRow = await database.query(
+    `SELECT token_expires_at <= NOW() AS expired, fcm_token
+     FROM devices WHERE device_id = $1`,
+    [outsider.deviceId]
+  );
+  assert.equal(revokedRow.rows[0]?.expired, true);
+  assert.equal(revokedRow.rows[0]?.fcm_token, null);
 });

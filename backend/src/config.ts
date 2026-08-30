@@ -15,12 +15,16 @@ const schema = z.object({
   LIVEKIT_API_KEY: z.string().min(3).default("devkey"),
   LIVEKIT_API_SECRET: z.string().min(32).default("devsecret-change-me-at-least-32-bytes"),
   TRUST_PROXY: z.enum(["true", "false"]).default("false").transform((value) => value === "true"),
-  FIREBASE_SERVICE_ACCOUNT_JSON: z.string().optional(),
+  FIREBASE_SERVICE_ACCOUNT_JSON: z.preprocess(
+    (value) => value === "" ? undefined : value,
+    z.string().min(2).max(65_536).optional()
+  ),
   MESSAGE_TTL_DAYS: z.coerce.number().int().min(1).max(90).default(30),
   CALL_SIGNAL_TTL_SECONDS: z.coerce.number().int().min(15).max(300).default(60),
   CALL_MAX_FUTURE_SKEW_SECONDS: z.coerce.number().int().min(0).max(60).default(15),
   CALL_ACTIVE_LEASE_SECONDS: z.coerce.number().int().min(30).max(300).default(120),
   MAX_REGISTRATION_CHALLENGES_PER_DEVICE: z.coerce.number().int().min(1).max(16).default(4),
+  MAX_REGISTRATION_CHALLENGES_PER_ACCOUNT: z.coerce.number().int().min(1).max(64).default(16),
   MAX_MAILBOX_MESSAGES: z.coerce.number().int().min(100).max(100_000).default(10_000),
   MAX_PENDING_MESSAGES_PER_PAIR: z.coerce.number().int().min(10).max(10_000).default(100),
   HTTP_REQUEST_TIMEOUT_MS: z.coerce.number().int().min(2_000).max(120_000).default(15_000),

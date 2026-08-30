@@ -1,0 +1,17 @@
+{
+  "name": "OmniRelay",
+  "short_name": "OmniRelay",
+  "description": "Privacy-first messaging and voice across resilient communication paths.",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#fffaf0",
+  "theme_color": "#fffaf0",
+  "icons": [
+    {
+      "src": "/logo-mark.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any maskable"
+    }
+  ]
+}

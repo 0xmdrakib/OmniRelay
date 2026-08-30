@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 48 48" role="img" aria-labelledby="title">
+  <title id="title">OmniRelay</title>
+  <rect width="48" height="48" rx="14" fill="#0a0a0a"/>
+  <circle cx="15" cy="24" r="5" fill="#ffb084"/>
+  <circle cx="33" cy="14" r="4" fill="#b8a4ed"/>
+  <circle cx="33" cy="34" r="4" fill="#a4d4c5"/>
+  <path d="M20 22.5 29 16M20 25.5 29 32" fill="none" stroke="#fffaf0" stroke-width="3" stroke-linecap="round"/>
+</svg>

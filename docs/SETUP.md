@@ -14,6 +14,8 @@ Android release configuration, and automated checks.
 - PowerShell for the commands below; use PowerShell 7 on a Linux server
 - Node.js 24 and the pnpm version pinned in `backend/package.json` for backend
   development and tests outside Docker
+- Node.js 22–24 and the package manager pinned in `website/package.json` for the
+  isolated public-site build
 - Two physical Android 8.0+ phones for end-to-end tests; nearby mode depends on
   each device's BLE/Wi-Fi Aware support. Use three phones to validate volunteer
   opportunistic forwarding behavior.
@@ -43,8 +45,10 @@ TRUST_PROXY=false
 ```
 
 `YOUR_PC_IP` must be the host's LAN address reachable from both phones, not
-`127.0.0.1`. Set `TURN_REALM` to your chosen TURN realm. Leave
-`FIREBASE_SERVICE_ACCOUNT_JSON` empty if testing without push wake-ups.
+`127.0.0.1`. Set `TURN_REALM` to your chosen TURN realm. Google login is now a
+required account gate, so set a real `FIREBASE_SERVICE_ACCOUNT_JSON` before
+testing internet registration. Missing Admin configuration leaves health checks
+available but rejects every new registration token.
 
 ### 2. Render LiveKit configuration
 
@@ -88,14 +92,21 @@ to both phones; a healthy HTTP endpoint alone does not verify call media.
 With JDK 17 selected, build an APK for the same LAN host:
 
 ```powershell
-./gradlew.bat assembleDebug -POMNIRELAY_BACKEND_URL=http://YOUR_PC_IP:8080
+./gradlew.bat assembleDebug `
+  -POMNIRELAY_BACKEND_URL=http://YOUR_PC_IP:8080 `
+  -POMNIRELAY_FIREBASE_API_KEY=YOUR_FIREBASE_API_KEY `
+  -POMNIRELAY_FIREBASE_APP_ID=YOUR_FIREBASE_APP_ID `
+  -POMNIRELAY_FIREBASE_PROJECT_ID=YOUR_FIREBASE_PROJECT_ID `
+  -POMNIRELAY_FIREBASE_SENDER_ID=YOUR_FIREBASE_SENDER_ID `
+  -POMNIRELAY_GOOGLE_WEB_CLIENT_ID=YOUR_WEB_OAUTH_CLIENT_ID
 ```
 
 On Linux or macOS, use `./gradlew` instead of `./gradlew.bat`. The APK is written
 to `app/build/outputs/apk/debug/app-debug.apk` and is intentionally excluded
 from Git.
 
-1. Install the APK on both phones and connect them to the reachable LAN.
+1. Install the APK on both phones, connect them to the reachable LAN, and sign
+   in with an authorized Google account on each device.
 2. Invoke each feature and grant its notification, microphone, Bluetooth, or
    Wi-Fi permission when requested. OmniRelay deliberately does not request all
    permissions at first launch; denial should disable only the affected feature.
@@ -106,6 +117,12 @@ from Git.
 4. Test messaging, delivery states, incoming calls, and two-way audio.
 5. Test nearby transport separately with internet disabled, then work through
    the remaining [device-validation checklist](RELEASE_CHECKLIST.md#device-validation).
+
+The first successful Google sign-in is bound to the local cryptographic device
+identity using Android Keystore. Signing out removes the relay session but does
+not remove that ownership binding. A different Google account is refused so it
+cannot inherit local contacts or message history; changing ownership requires an
+explicit app-data reset, which also destroys the local Secret Link and unrecovered data.
 
 For a three-phone relay test, opt the middle phone into **Volunteer nearby
 relay**, select BALANCED or GENEROUS, and keep sender and receiver outside direct
@@ -149,19 +166,23 @@ The script generates random database, LiveKit, and TURN credentials and creates
 the ignored `.env` and LiveKit configuration. It refuses to overwrite an
 existing `.env`; preserve existing deployment secrets when updating a server.
 
-### 2. Configure Firebase push delivery
+### 2. Configure required Firebase Authentication and push delivery
 
-Create a Firebase Android app for the intended application ID. Configure both
-sides using the same Firebase project:
+Create a Firebase Android app for the intended application ID. In Firebase
+Authentication, enable the Google provider. Register both debug and release
+SHA-1/SHA-256 certificate fingerprints and create a Web OAuth client ID. Configure
+both sides using the same Firebase project:
 
-- **Server:** Put the service-account JSON on one line in the server `.env` as
-  `FIREBASE_SERVICE_ACCOUNT_JSON`. This private credential stays on the server.
-- **Android:** Provide the four client values shown under
+- **Server:** Put the complete service-account JSON on one line in the server
+  `.env` as `FIREBASE_SERVICE_ACCOUNT_JSON`. This private credential stays on
+  the server and verifies Firebase ID tokens as well as sending FCM wake-ups.
+- **Android:** Provide the five client values shown under
   [Android release configuration](#android-release-configuration).
 
-Without this configuration, HTTP/WebSocket delivery remains available, but
-FCM wake-ups are disabled. Background delivery must be tested with real devices,
-Firebase credentials, and the applicable Android battery restrictions.
+Without the Android values, the app fails closed on its configuration screen.
+Without the server service account, cryptographic device registration returns
+`401` and internet relay delivery cannot begin. Background delivery must be
+tested with real devices, Firebase credentials, and applicable battery restrictions.
 
 ### 3. Open the required ports and start the stack
 
@@ -171,13 +192,15 @@ production; Caddy fronts them with TLS.
 
 ```powershell
 ./deploy/start-production.ps1
-Invoke-RestMethod https://relay.example.com/healthz
+Invoke-RestMethod https://relay.example.com/readyz
 ```
 
 The script validates Compose configuration, starts the production profile,
 and checks local relay health. Caddy handles certificates for the configured
 domains when DNS and network access are ready. Verify public HTTPS separately;
-local health does not prove public TLS, FCM, TURN, or two-way audio works.
+Liveness remains available at `/healthz`; `/readyz` fails until PostgreSQL and
+Firebase account registration are configured. Readiness still does not prove
+public TLS, FCM delivery, TURN, or two-way audio works.
 
 Set up encrypted database backups, a tested restore procedure, uptime and disk
 monitoring, and credential recovery before accepting production traffic.
@@ -188,7 +211,8 @@ The generated configuration starts conservatively: four PostgreSQL pool
 connections, 64 admitted HTTP requests, 768 TCP connections, 512 WebSockets,
 four active plus 256 queued FCM jobs, 100 pending envelopes per sender/recipient
 pair, four outstanding registration challenges per identity, a 120-second active
-call lease, finite query/request timeouts, and 500-row cleanup batches every 15 minutes.
+call lease, 16 challenges per verified account, finite query/request timeouts,
+and 500-row cleanup batches every 15 minutes.
 These controls protect a small server from unlimited queues; they are not a
 universal capacity estimate.
 
@@ -215,6 +239,7 @@ OMNIRELAY_FIREBASE_API_KEY=YOUR_FIREBASE_API_KEY
 OMNIRELAY_FIREBASE_APP_ID=YOUR_FIREBASE_APP_ID
 OMNIRELAY_FIREBASE_PROJECT_ID=YOUR_FIREBASE_PROJECT_ID
 OMNIRELAY_FIREBASE_SENDER_ID=YOUR_FIREBASE_SENDER_ID
+OMNIRELAY_GOOGLE_WEB_CLIENT_ID=YOUR_WEB_OAUTH_CLIENT_ID
 OMNIRELAY_KEYSTORE_FILE=C:/secure/omnirelay-release.jks
 OMNIRELAY_KEYSTORE_PASSWORD=YOUR_KEYSTORE_PASSWORD
 OMNIRELAY_KEY_ALIAS=YOUR_KEY_ALIAS
@@ -223,7 +248,7 @@ OMNIRELAY_KEY_PASSWORD=YOUR_KEY_PASSWORD
 
 Use an absolute keystore path appropriate for the build machine. Restrict access
 to the keystore and user-level properties file. The app initializes Firebase
-from the four Gradle values; do not commit service-account credentials or
+from the five Gradle values; do not commit service-account credentials or
 Firebase configuration files.
 
 Build the release APK and Android App Bundle:
@@ -272,3 +297,19 @@ pnpm test:integration
 These tests exercise backend registration, message delivery, acknowledgements,
 and call signaling/token authorization, not physical radios or live microphone
 audio. See the [CI workflow](../.github/workflows/ci.yml) for the automated checks.
+
+### Public website
+
+The site is intentionally independent from the Android and backend projects:
+
+```powershell
+cd website
+pnpm install --frozen-lockfile
+pnpm audit --audit-level=low
+pnpm verify
+```
+
+For Vercel, select `website` as the project Root Directory. The bundle verifier
+rejects Android/backend source markers, source maps, oversized public assets,
+or a missing GitHub Releases link. Before launch, replace the default social URL
+if the final Vercel/custom domain is not `https://omnirelay.vercel.app`.

@@ -24,6 +24,11 @@ Contacts pair by exchanging Secret Links. The app accepts incoming content
 only from locally paired identities and keeps raw discovery nodes out of the
 contact list.
 
+Google sign-in is required before the app starts its communication service.
+Firebase verifies the account, while the backend stores only the verified UID
+and binds it to the device's existing cryptographic identity; Google profile
+data is not used as an E2EE contact identity.
+
 ## Features
 
 - Mutual Secret Link pairing with custom contact names
@@ -38,6 +43,8 @@ contact list.
   follow-up fallback on API 26–28 and bounded BLE GATT transport
 - Protocol-v2 directional frame keys and immutable sender/recipient/header AEAD binding
 - X25519 private-key proof plus Ed25519 signatures for backend registration
+- Credential Manager Google sign-in with server-verified Firebase UID binding
+  and cross-account device-takeover rejection
 - Recipient-issued sender→recipient route capabilities; the backend stores only
   capability hashes and rejects mail from identities the recipient has not authorized
 - Lossless 16 kHz PCM over an established NDP, ADPCM over BLE, and WebRTC internet audio
@@ -66,12 +73,14 @@ exists.
 
 ## Tech stack
 
-- **Android:** Kotlin, Jetpack Compose, Room, WorkManager, and Core Telecom
+- **Android:** Kotlin, Jetpack Compose, Credential Manager, Firebase Auth, Room,
+  WorkManager, and Core Telecom
 - **Cryptography:** directional X25519/HKDF/AES-256-GCM, Ed25519, and Android Keystore
 - **Connectivity:** OkHttp, Firebase Cloud Messaging, Wi-Fi Aware, and BLE GATT
 - **Voice:** LiveKit/WebRTC, coturn, lossless PCM over NDP, and IMA-ADPCM over BLE
 - **Backend:** Node.js 24, TypeScript, Fastify, WebSocket, and PostgreSQL
 - **Infrastructure:** Docker Compose, Caddy TLS, and GitHub Actions
+- **Public showcase:** isolated static Vite site under `website/`, configured for Vercel
 
 ## Getting started
 
@@ -90,11 +99,15 @@ Credentials, signing keys, local configuration, and build artifacts stay outside
 Git. Keep the repository private and store deployment secrets on the server or
 in a secrets manager.
 
+The public showcase is built only from [`website/`](website/). Configure that
+folder as the Vercel project Root Directory; its production bundle contains no
+Android or backend source. APK buttons point to the official GitHub Releases page.
+
 ## Testing and release
 
 The [CI workflow](.github/workflows/ci.yml) runs Android unit tests, lint,
-debug/release builds, backend checks and integration tests, a Docker image
-build, and full-history secret scanning. See the [test commands](docs/SETUP.md#tests)
+debug/release builds, backend checks and integration tests, an isolated website
+bundle gate, a Docker image build, and full-history secret scanning. See the [test commands](docs/SETUP.md#tests)
 to run the checks locally.
 
 This is not yet a production release. Two-phone audio, three-phone nearby relay,

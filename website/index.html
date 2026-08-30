@@ -1,0 +1,163 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="theme-color" content="#fffaf0" />
+    <meta name="color-scheme" content="light" />
+    <meta name="description" content="OmniRelay is a privacy-first Android communication system for encrypted messaging and voice across internet, Wi-Fi Aware, and Bluetooth relay paths." />
+    <meta property="og:type" content="website" />
+    <meta property="og:url" content="%PUBLIC_SITE_URL%/" />
+    <meta property="og:site_name" content="OmniRelay" />
+    <meta property="og:title" content="OmniRelay — Private messages. Resilient paths." />
+    <meta property="og:description" content="Encrypted messaging and voice that select the strongest available communication path." />
+    <meta property="og:image" content="%PUBLIC_SITE_URL%/omnirelay-clay-relay.jpg" />
+    <meta property="og:image:alt" content="OmniRelay encrypted communication paths rendered in clay" />
+    <meta name="twitter:card" content="summary_large_image" />
+    <meta name="twitter:title" content="OmniRelay — Private messages. Resilient paths." />
+    <meta name="twitter:description" content="Encrypted messaging and voice that select the strongest available communication path." />
+    <meta name="twitter:image" content="%PUBLIC_SITE_URL%/omnirelay-clay-relay.jpg" />
+    <link rel="icon" href="/logo-mark.svg" type="image/svg+xml" />
+    <link rel="canonical" href="%PUBLIC_SITE_URL%/" />
+    <link rel="manifest" href="/site.webmanifest" />
+    <title>OmniRelay — Private messages. Resilient paths.</title>
+  </head>
+  <body>
+    <a class="skip-link" href="#main">Skip to content</a>
+    <header class="site-header">
+      <div class="nav-shell">
+        <a class="brand" href="#top" aria-label="OmniRelay home">
+          <img src="/logo-mark.svg" width="38" height="38" alt="" />
+          <span>OmniRelay</span>
+        </a>
+        <button class="menu-button" type="button" aria-expanded="false" aria-controls="site-nav">
+          <span class="menu-line"></span><span class="menu-line"></span>
+          <span class="sr-only">Toggle navigation</span>
+        </button>
+        <nav id="site-nav" class="site-nav" aria-label="Primary navigation">
+          <a href="#paths">Paths</a>
+          <a href="#security">Security</a>
+          <a href="#flow">How it works</a>
+          <a class="nav-download" data-release-link href="https://github.com/0xmdrakib/OmniRelay/releases/latest" rel="noopener noreferrer">Get the APK</a>
+        </nav>
+      </div>
+    </header>
+
+    <main id="main">
+      <section id="top" class="hero section-shell" aria-labelledby="hero-title">
+        <div class="hero-copy">
+          <div class="eyebrow"><span class="live-dot"></span> Private alpha · Android</div>
+          <h1 id="hero-title">Private conversations.<br /><span>Resilient by design.</span></h1>
+          <p class="hero-lead">OmniRelay combines end-to-end encryption with intelligent internet, Wi-Fi Aware, and Bluetooth paths—built around mutual contacts, low overhead, and honest connectivity.</p>
+          <div class="hero-actions">
+            <a class="button button-primary" data-release-link href="https://github.com/0xmdrakib/OmniRelay/releases/latest" rel="noopener noreferrer">Get the latest APK <span aria-hidden="true">↗</span></a>
+            <a class="button button-secondary" href="#flow">See how it works</a>
+          </div>
+          <p class="release-note">Release downloads are served from the official GitHub Releases page.</p>
+        </div>
+
+        <div class="route-console" aria-label="Example of OmniRelay selecting available paths">
+          <div class="console-topline">
+            <span>Secure route</span>
+            <span class="status-pill"><span class="live-dot"></span> Ready</span>
+          </div>
+          <div class="peer-row">
+            <div class="peer"><span class="peer-orb peach">Y</span><span><strong>You</strong><small>Encrypted sender</small></span></div>
+            <div class="relay-line" aria-hidden="true"><i></i><i></i><i></i></div>
+            <div class="peer peer-right"><span><strong>Paired contact</strong><small>Verified recipient</small></span><span class="peer-orb lavender">P</span></div>
+          </div>
+          <div class="path-stack">
+            <div class="path-item path-active"><span class="path-icon">01</span><span><strong>Internet relay</strong><small>Available · low latency</small></span><b>LIVE</b></div>
+            <div class="path-item"><span class="path-icon">02</span><span><strong>Wi-Fi Aware</strong><small>Nearby high-bandwidth path</small></span><b>READY</b></div>
+            <div class="path-item"><span class="path-icon">03</span><span><strong>Bluetooth relay</strong><small>Low-power local fallback</small></span><b>STANDBY</b></div>
+          </div>
+          <div class="console-footer"><span class="shield-mark" aria-hidden="true">✓</span> Payload encrypted before route selection</div>
+        </div>
+      </section>
+
+      <section class="trust-strip" aria-label="Core product principles">
+        <div class="section-shell trust-grid">
+          <span>End-to-end encrypted</span><i></i><span>Mutual contacts only</span><i></i><span>Relay-minimized metadata</span><i></i><span>Adaptive resource use</span>
+        </div>
+      </section>
+
+      <section id="paths" class="feature-section section-shell" aria-labelledby="paths-title">
+        <div class="section-intro">
+          <p class="section-label">ONE MESSAGE · MULTIPLE WAYS FORWARD</p>
+          <h2 id="paths-title">Communication that works with the paths you actually have.</h2>
+          <p>OmniRelay keeps content private while choosing between available transport layers. Every path has a clear purpose, limit, and resource budget.</p>
+        </div>
+        <div class="feature-grid">
+          <article class="feature-card card-pink"><span class="card-index">01</span><h3>Private by default</h3><p>Messages are encrypted on the sender and authenticated for the intended paired recipient before they enter any relay.</p><div class="mini-fragment"><span>Encrypted capsule</span><strong>CONTENT HIDDEN</strong></div></article>
+          <article class="feature-card card-teal"><span class="card-index">02</span><h3>Adaptive routing</h3><p>The route engine evaluates internet, Wi-Fi Aware, and Bluetooth availability without exposing raw mesh peers as contacts.</p><div class="route-pills"><span>Internet</span><span>NAN</span><span>BLE</span></div></article>
+          <article class="feature-card card-lavender"><span class="card-index">03</span><h3>Low-impact relays</h3><p>Volunteer devices use bounded queues, hop limits, fair scheduling, and adaptive battery policies—never unlimited background work.</p><div class="meter"><span class="meter-value"></span></div><small>Resource tier · Conservative</small></article>
+          <article class="feature-card card-peach"><span class="card-index">04</span><h3>Voice tuned to the path</h3><p>Internet calls use realtime media infrastructure; established nearby links can prioritize lossless PCM while BLE falls back efficiently.</p><div class="wave" aria-hidden="true"><i></i><i></i><i></i><i></i><i></i><i></i><i></i></div></article>
+          <article class="feature-card card-ochre"><span class="card-index">05</span><h3>Mutual contacts</h3><p>Secret Links create explicit peer relationships. Unknown senders and unauthorized route requests are rejected before delivery work.</p><div class="contact-fragment"><span class="peer-orb teal">A</span><span><strong>Paired contact</strong><small>Identity verified</small></span><b>✓</b></div></article>
+          <article class="feature-card card-cream"><span class="card-index">06</span><h3>Honest delivery states</h3><p>Queued, delivered, failed, ringing, accepted, and ended states are modeled explicitly—without pretending a missing path is reachable.</p><div class="state-row"><span>Queued</span><span>Delivered</span><span>✓</span></div></article>
+        </div>
+      </section>
+
+      <section id="flow" class="flow-section">
+        <div class="section-shell">
+          <div class="section-intro compact">
+            <p class="section-label">HOW OMNIRELAY WORKS</p>
+            <h2>Simple for people. Deliberate underneath.</h2>
+          </div>
+          <ol class="flow-grid">
+            <li><span>1</span><div><h3>Pair intentionally</h3><p>Exchange a Secret Link out of band and add a trusted contact by name.</p></div></li>
+            <li><span>2</span><div><h3>Encrypt locally</h3><p>The sender authenticates the destination and encrypts the payload on-device.</p></div></li>
+            <li><span>3</span><div><h3>Choose a viable path</h3><p>Internet, Wi-Fi Aware, or BLE is selected according to reachability and policy.</p></div></li>
+            <li><span>4</span><div><h3>Confirm the real state</h3><p>Delivery and call transitions advance only after valid authenticated events.</p></div></li>
+          </ol>
+        </div>
+      </section>
+
+      <section id="security" class="security-section section-shell" aria-labelledby="security-title">
+        <div class="security-card">
+          <div class="security-copy">
+            <p class="section-label on-dark">SECURITY IS THE ARCHITECTURE</p>
+            <h2 id="security-title">Relays move ciphertext—not conversations.</h2>
+            <p>OmniRelay separates identity, route authorization, and payload encryption so intermediate devices can forward bounded capsules without receiving message content.</p>
+            <a class="button button-light" href="#release">Review release status</a>
+          </div>
+          <ul class="security-list">
+            <li><span>✓</span><div><strong>Device-bound identity</strong><small>X25519 encryption and Ed25519 ownership proof</small></div></li>
+            <li><span>✓</span><div><strong>Authenticated encryption</strong><small>Sender, recipient, and security header bound as AAD</small></div></li>
+            <li><span>✓</span><div><strong>Private relay capsules</strong><small>Padded, double-encrypted, replay-bounded forwarding</small></div></li>
+            <li><span>✓</span><div><strong>Fail-closed registration</strong><small>Verified account plus cryptographic device proof</small></div></li>
+          </ul>
+        </div>
+      </section>
+
+      <section class="truth-section section-shell" aria-labelledby="truth-title">
+        <div class="truth-mark">↗</div>
+        <div><p class="section-label">HONEST CONNECTIVITY</p><h2 id="truth-title">A message still needs a path.</h2></div>
+        <p>No app can reach a device that has no internet and no nearby radio or connected relay route. OmniRelay is designed to use every legitimate available path—not to claim one exists when it does not.</p>
+      </section>
+
+      <section id="release" class="release-section section-shell" aria-labelledby="release-title">
+        <div class="release-copy">
+          <p class="section-label">PRIVATE ALPHA</p>
+          <h2 id="release-title">Ready to test the next path?</h2>
+          <p>The signed Android package will be published through the official GitHub Releases section after device validation is complete.</p>
+          <a class="button button-primary" data-release-link href="https://github.com/0xmdrakib/OmniRelay/releases/latest" rel="noopener noreferrer">Open GitHub Releases <span aria-hidden="true">↗</span></a>
+        </div>
+        <figure class="release-art">
+          <img src="/omnirelay-clay-relay.jpg" alt="Clay-rendered OmniRelay devices connected through encrypted relay paths" width="1600" height="900" loading="lazy" decoding="async" />
+        </figure>
+      </section>
+    </main>
+
+    <footer class="site-footer">
+      <div class="section-shell footer-grid">
+        <div><a class="brand" href="#top"><img src="/logo-mark.svg" width="38" height="38" alt="" /><span>OmniRelay</span></a><p>Private communication across resilient paths.</p></div>
+        <div><strong>Product</strong><a href="#paths">Paths</a><a href="#security">Security</a><a href="#flow">How it works</a></div>
+        <div><strong>Release</strong><a data-release-link href="https://github.com/0xmdrakib/OmniRelay/releases/latest" rel="noopener noreferrer">Android APK</a><a href="#release">Release status</a></div>
+        <div class="footer-note"><strong>Built with clear limits</strong><p>OmniRelay is under active private-alpha testing. Capabilities depend on device support and available paths.</p></div>
+      </div>
+      <div class="section-shell footer-bottom"><span>© <span data-current-year></span> OmniRelay</span><span>Privacy-first · Resource-aware · Android native</span></div>
+    </footer>
+
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>

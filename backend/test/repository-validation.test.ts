@@ -24,12 +24,38 @@ test("repository rejects unsafe lease, route, and challenge bounds before databa
     repository.saveRegistrationChallenge(
       randomUUID(),
       deviceId,
+      "firebase-account-uid",
       Buffer.alloc(32).toString("base64"),
       Buffer.alloc(44).toString("base64"),
       Buffer.alloc(32).toString("base64"),
       Buffer.alloc(32).toString("base64"),
-      17
+      17,
+      16
     ),
     /maxOutstanding registration challenges/
+  );
+  await assert.rejects(
+    repository.saveRegistrationChallenge(
+      randomUUID(),
+      deviceId,
+      "firebase-account-uid",
+      Buffer.alloc(32).toString("base64"),
+      Buffer.alloc(44).toString("base64"),
+      Buffer.alloc(32).toString("base64"),
+      Buffer.alloc(32).toString("base64"),
+      4,
+      65
+    ),
+    /maxOutstandingForAccount registration challenges/
+  );
+  await assert.rejects(
+    repository.registerOrRotate(
+      deviceId,
+      "",
+      Buffer.alloc(32).toString("base64"),
+      Buffer.alloc(44).toString("base64"),
+      "device-session-token"
+    ),
+    /invalid account UID/
   );
 });

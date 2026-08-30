@@ -19,8 +19,8 @@ class OmniRelayApplication : Application() {
     override fun onCreate() {
         super.onCreate()
         installModernCryptoProvider()
-        schedulePeriodicRelaySync()
         initializeFirebaseIfConfigured()
+        schedulePeriodicRelaySync()
     }
 
     private fun installModernCryptoProvider() {
@@ -36,7 +36,7 @@ class OmniRelayApplication : Application() {
             BuildConfig.FIREBASE_PROJECT_ID.isBlank() ||
             BuildConfig.FIREBASE_SENDER_ID.isBlank()
         ) {
-            Log.i("OmniRelayApplication", "Firebase config absent; WebSocket delivery remains enabled")
+            Log.i("OmniRelayApplication", "Firebase config absent; Google sign-in and relay startup are disabled")
             return
         }
         if (FirebaseApp.getApps(this).isEmpty()) {

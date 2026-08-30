@@ -24,6 +24,8 @@
 - LiveKit and TURN are trusted for availability. Call audio is additionally
   encrypted with a per-call key derived independently by the paired devices.
 - FCM is a wake-up channel only and receives no message or call plaintext.
+- Firebase Authentication and Google are trusted to authenticate account access.
+  The relay receives the verified Firebase UID but not the Google password.
 
 ## Defenses
 
@@ -33,6 +35,9 @@
   IDs, keyed route tags, random padding, replay suppression, and hop limits.
 - Ed25519 challenge signatures plus ephemeral-DH proof of the X25519 private key,
   with pinned signing identities and versioned local relay credentials.
+- Revocation-aware Firebase ID-token verification on both registration steps,
+  account-bound challenges, immutable device→UID binding, revocable 30-day device sessions,
+  and a separate Keystore-authenticated local owner binding that survives sign-out.
 - Recipient-issued, direction-specific route capabilities prevent an arbitrary
   registered/Sybil identity from consuming another device's mailbox or FCM work;
   only capability hashes are retained in PostgreSQL.
@@ -86,6 +91,8 @@
   nearby radio path physically exists.
 - Physical two-device BLE, Wi-Fi Aware, Doze, OEM background restrictions, FCM,
   and audio routing require device-lab validation before production release.
+- Account self-service device listing, remote session revocation, account deletion,
+  and ownership recovery are not yet implemented and remain release work.
 
 ## Release gate
 

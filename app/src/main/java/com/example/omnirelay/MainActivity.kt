@@ -45,6 +45,12 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.example.omnirelay.data.local.MessageEntity
+import com.example.omnirelay.auth.GoogleAccountManager
+import com.example.omnirelay.auth.GoogleAccountProfile
+import com.example.omnirelay.auth.GoogleSignInCancelledException
+import com.example.omnirelay.auth.NoAuthorizedGoogleAccountException
+import com.example.omnirelay.network.InternetRelayClient
+import com.example.omnirelay.network.SecureTokenStore
 import com.example.omnirelay.permissions.PermissionCapabilityPlanner
 import com.example.omnirelay.permissions.PermissionCapabilityPlanner.CapabilityPlan
 import com.example.omnirelay.permissions.PermissionCapabilityPlanner.PermissionRequestGroup
@@ -58,7 +64,20 @@ import com.example.omnirelay.theme.OmniRelayTheme
 import com.example.omnirelay.routing.AdaptiveResourcePolicy.UserResourceTier
 import com.example.omnirelay.utils.PairedContact
 import com.example.omnirelay.utils.SettingsManager
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withTimeoutOrNull
 import java.util.Locale
+
+private sealed interface AccountUiState {
+    data object Unconfigured : AccountUiState
+    data class SignedOut(val message: String? = null) : AccountUiState
+    data object SigningIn : AccountUiState
+    data class SignedIn(val profile: GoogleAccountProfile) : AccountUiState
+}
+
+private const val ACCOUNT_MISMATCH_MESSAGE =
+    "This device identity belongs to a different Google account. Sign in with the original account, " +
+        "or explicitly reset app data only after confirming identity recovery."
 
 class MainActivity : ComponentActivity() {
 
@@ -68,6 +87,8 @@ class MainActivity : ComponentActivity() {
     private var permissionRevision by mutableIntStateOf(0)
     private var pendingPermissionRationale by mutableStateOf<PermissionRequestGroup?>(null)
     private var identityStartupError by mutableStateOf<String?>(null)
+    private lateinit var googleAccountManager: GoogleAccountManager
+    private var accountUiState by mutableStateOf<AccountUiState>(AccountUiState.Unconfigured)
 
     private val serviceConnection = object : ServiceConnection {
         override fun onServiceConnected(name: ComponentName?, service: IBinder?) {
@@ -102,9 +123,28 @@ class MainActivity : ComponentActivity() {
                 "did not create a replacement identity. Restore the device/Keystore state or " +
                 "explicitly reset app data only after confirming recovery options."
         }
-        if (identityStartupError == null) startAndBindService()
+        googleAccountManager = GoogleAccountManager(this)
+        accountUiState = when {
+            !googleAccountManager.isConfigured -> AccountUiState.Unconfigured
+            else -> {
+                val profile = googleAccountManager.currentProfile()
+                when {
+                    profile == null -> AccountUiState.SignedOut()
+                    runCatching { SecureTokenStore(this).bindAccountUid(profile.uid) }.getOrDefault(false) ->
+                        AccountUiState.SignedIn(profile)
+                    else -> {
+                        googleAccountManager.clearFirebaseSession()
+                        AccountUiState.SignedOut(ACCOUNT_MISMATCH_MESSAGE)
+                    }
+                }
+            }
+        }
+        if (identityStartupError == null && accountUiState is AccountUiState.SignedIn) {
+            startAndBindService()
+        }
 
         setContent {
+            val authenticationScope = rememberCoroutineScope()
             val revision = permissionRevision
             val permissionPlan = remember(revision) { currentPermissionPlan() }
             OmniRelayTheme {
@@ -116,11 +156,34 @@ class MainActivity : ComponentActivity() {
                     if (startupError != null) {
                         IdentityUnavailableScreen(startupError)
                     } else {
-                        MinimalAppDashboard(
-                            omniService = omniService,
-                            permissionPlan = permissionPlan,
-                            onRequestPermission = ::showPermissionRationale
-                        )
+                        when (val accountState = accountUiState) {
+                            AccountUiState.Unconfigured -> GoogleAuthConfigurationScreen()
+                            is AccountUiState.SignedOut -> GoogleSignInScreen(
+                                isLoading = false,
+                                message = accountState.message,
+                                onAutomaticSignIn = {
+                                    authenticationScope.launch { performGoogleSignIn(true) }
+                                },
+                                onSignIn = {
+                                    authenticationScope.launch { performGoogleSignIn(false) }
+                                }
+                            )
+                            AccountUiState.SigningIn -> GoogleSignInScreen(
+                                isLoading = true,
+                                message = null,
+                                onAutomaticSignIn = {},
+                                onSignIn = {}
+                            )
+                            is AccountUiState.SignedIn -> MinimalAppDashboard(
+                                omniService = omniService,
+                                permissionPlan = permissionPlan,
+                                accountProfile = accountState.profile,
+                                onSignOut = {
+                                    authenticationScope.launch { performGoogleSignOut() }
+                                },
+                                onRequestPermission = ::showPermissionRationale
+                            )
+                        }
                     }
                 }
             }
@@ -213,9 +276,56 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun startAndBindService() {
+        if (identityStartupError != null || accountUiState !is AccountUiState.SignedIn) return
         val intent = Intent(this, OmniRelayService::class.java)
         runCatching { ContextCompat.startForegroundService(this, intent) }
         if (!isBound) bindService(intent, serviceConnection, Context.BIND_AUTO_CREATE)
+    }
+
+    private suspend fun performGoogleSignIn(authorizedAccountsOnly: Boolean) {
+        if (accountUiState is AccountUiState.SigningIn) return
+        accountUiState = AccountUiState.SigningIn
+        try {
+            val profile = googleAccountManager.signIn(authorizedAccountsOnly)
+            if (!runCatching { SecureTokenStore(this).bindAccountUid(profile.uid) }.getOrDefault(false)) {
+                googleAccountManager.signOut()
+                accountUiState = AccountUiState.SignedOut(ACCOUNT_MISMATCH_MESSAGE)
+                return
+            }
+            accountUiState = AccountUiState.SignedIn(profile)
+            startAndBindService()
+        } catch (_: NoAuthorizedGoogleAccountException) {
+            accountUiState = AccountUiState.SignedOut()
+        } catch (_: GoogleSignInCancelledException) {
+            accountUiState = AccountUiState.SignedOut(
+                if (authorizedAccountsOnly) null else "Google sign-in was cancelled."
+            )
+        } catch (_: Exception) {
+            accountUiState = AccountUiState.SignedOut(
+                if (authorizedAccountsOnly) null
+                else "Google could not complete sign-in. Check Play Services and your connection, then try again."
+            )
+        }
+    }
+
+    private suspend fun performGoogleSignOut() {
+        accountUiState = AccountUiState.SigningIn
+        val signOutRelayClient = InternetRelayClient(this)
+        if (signOutRelayClient.isConfigured && signOutRelayClient.credentials() != null) {
+            withTimeoutOrNull(3_000) {
+                runCatching { signOutRelayClient.revokeSession() }
+            }
+        }
+        omniService?.setAppInForeground(false)
+        if (isBound) {
+            unbindService(serviceConnection)
+            isBound = false
+        }
+        omniService = null
+        stopService(Intent(this, OmniRelayService::class.java))
+        SecureTokenStore(this).clear()
+        googleAccountManager.signOut()
+        accountUiState = AccountUiState.SignedOut()
     }
 
     override fun onDestroy() {
@@ -230,6 +340,127 @@ class MainActivity : ComponentActivity() {
 // ==========================================
 // LUXURY SOFT PASTEL GLASS UI DASHBOARD
 // ==========================================
+@Composable
+fun GoogleAuthConfigurationScreen() {
+    Box(
+        modifier = Modifier.fillMaxSize().padding(24.dp),
+        contentAlignment = Alignment.Center
+    ) {
+        Card(
+            modifier = Modifier.fillMaxWidth().widthIn(max = 480.dp),
+            shape = RoundedCornerShape(28.dp),
+            colors = CardDefaults.cardColors(containerColor = Color.White)
+        ) {
+            Column(modifier = Modifier.padding(28.dp), horizontalAlignment = Alignment.CenterHorizontally) {
+                Box(
+                    modifier = Modifier.size(58.dp).background(Color(0xFFFFE7D9), RoundedCornerShape(18.dp)),
+                    contentAlignment = Alignment.Center
+                ) {
+                    Icon(Icons.Default.AdminPanelSettings, contentDescription = null, tint = Color(0xFFFF6B5A))
+                }
+                Spacer(Modifier.height(18.dp))
+                Text("Google sign-in needs configuration", fontWeight = FontWeight.Black, fontSize = 20.sp)
+                Spacer(Modifier.height(10.dp))
+                Text(
+                    "This build is locked because its Firebase and Google OAuth client settings are missing. " +
+                        "Install a production-configured build to continue.",
+                    color = Color(0xFF7E7E9A),
+                    fontSize = 13.sp,
+                    lineHeight = 20.sp
+                )
+            }
+        }
+    }
+}
+
+@Composable
+fun GoogleSignInScreen(
+    isLoading: Boolean,
+    message: String?,
+    onAutomaticSignIn: () -> Unit,
+    onSignIn: () -> Unit
+) {
+    LaunchedEffect(Unit) { onAutomaticSignIn() }
+    Box(
+        modifier = Modifier
+            .fillMaxSize()
+            .background(
+                Brush.linearGradient(
+                    listOf(Color(0xFFF3F2F8), Color(0xFFFFF4EC), Color(0xFFEDE9FF))
+                )
+            )
+            .padding(24.dp),
+        contentAlignment = Alignment.Center
+    ) {
+        Card(
+            modifier = Modifier.fillMaxWidth().widthIn(max = 480.dp),
+            shape = RoundedCornerShape(30.dp),
+            colors = CardDefaults.cardColors(containerColor = Color.White),
+            elevation = CardDefaults.cardElevation(defaultElevation = 4.dp)
+        ) {
+            Column(modifier = Modifier.padding(30.dp), horizontalAlignment = Alignment.CenterHorizontally) {
+                Box(
+                    modifier = Modifier
+                        .size(64.dp)
+                        .background(
+                            Brush.linearGradient(listOf(Color(0xFF7C66FF), Color(0xFF6C5CE7))),
+                            RoundedCornerShape(20.dp)
+                        ),
+                    contentAlignment = Alignment.Center
+                ) {
+                    Icon(Icons.Default.CellTower, contentDescription = null, tint = Color.White, modifier = Modifier.size(32.dp))
+                }
+                Spacer(Modifier.height(20.dp))
+                Text("Welcome to OmniRelay", fontWeight = FontWeight.Black, fontSize = 24.sp, color = Color(0xFF1E1C2E))
+                Spacer(Modifier.height(8.dp))
+                Text(
+                    "Sign in before messaging or calling. Your Google account controls access; " +
+                        "your E2EE Secret Link and private keys remain protected on this device.",
+                    color = Color(0xFF7E7E9A),
+                    fontSize = 13.sp,
+                    lineHeight = 20.sp
+                )
+                if (message != null) {
+                    Spacer(Modifier.height(14.dp))
+                    Text(message, color = Color(0xFFFF5A5F), fontSize = 12.sp)
+                }
+                Spacer(Modifier.height(24.dp))
+                Button(
+                    onClick = onSignIn,
+                    enabled = !isLoading,
+                    modifier = Modifier.fillMaxWidth().height(52.dp),
+                    shape = RoundedCornerShape(14.dp),
+                    colors = ButtonDefaults.buttonColors(
+                        containerColor = Color(0xFF1E1C2E),
+                        contentColor = Color.White
+                    )
+                ) {
+                    if (isLoading) {
+                        CircularProgressIndicator(
+                            modifier = Modifier.size(20.dp),
+                            color = Color.White,
+                            strokeWidth = 2.dp
+                        )
+                        Spacer(Modifier.width(10.dp))
+                        Text("CHECKING ACCOUNT", fontWeight = FontWeight.Bold)
+                    } else {
+                        Text("G", fontWeight = FontWeight.Black, fontSize = 18.sp)
+                        Spacer(Modifier.width(12.dp))
+                        Text("CONTINUE WITH GOOGLE", fontWeight = FontWeight.Bold)
+                    }
+                }
+                Spacer(Modifier.height(16.dp))
+                Text(
+                    "The relay stores only the verified account UID for device ownership—never your Google password.",
+                    color = Color(0xFF9A9AB0),
+                    fontSize = 11.sp,
+                    lineHeight = 16.sp
+                )
+            }
+        }
+    }
+}
+
 @Composable
 fun IdentityUnavailableScreen(message: String) {
     Box(modifier = Modifier.fillMaxSize().padding(24.dp), contentAlignment = Alignment.Center) {
@@ -252,6 +483,8 @@ fun IdentityUnavailableScreen(message: String) {
 fun MinimalAppDashboard(
     omniService: OmniRelayService?,
     permissionPlan: CapabilityPlan,
+    accountProfile: GoogleAccountProfile,
+    onSignOut: () -> Unit,
     onRequestPermission: (PermissionStage) -> Unit
 ) {
     val context = androidx.compose.ui.platform.LocalContext.current
@@ -484,6 +717,8 @@ fun MinimalAppDashboard(
                     2 -> SettingsScreen(
                         settingsManager = settingsManager,
                         permissionPlan = permissionPlan,
+                        accountProfile = accountProfile,
+                        onSignOut = onSignOut,
                         onRequestPermission = onRequestPermission,
                         onSettingsUpdated = {
                             refreshTrigger++
@@ -1139,6 +1374,8 @@ fun CallsScreen(
 fun SettingsScreen(
     settingsManager: SettingsManager,
     permissionPlan: CapabilityPlan,
+    accountProfile: GoogleAccountProfile,
+    onSignOut: () -> Unit,
     onRequestPermission: (PermissionStage) -> Unit,
     onSettingsUpdated: () -> Unit
 ) {
@@ -1164,6 +1401,53 @@ fun SettingsScreen(
             .padding(horizontal = 20.dp),
         verticalArrangement = Arrangement.spacedBy(16.dp)
     ) {
+        item {
+            Text(
+                text = "GOOGLE ACCOUNT",
+                fontWeight = FontWeight.Bold,
+                color = Color(0xFF7E7E9A),
+                fontSize = 12.sp,
+                letterSpacing = 1.sp
+            )
+        }
+
+        item {
+            Card(
+                modifier = Modifier.fillMaxWidth(),
+                shape = RoundedCornerShape(22.dp),
+                colors = CardDefaults.cardColors(containerColor = Color.White)
+            ) {
+                Row(
+                    modifier = Modifier.fillMaxWidth().padding(18.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Box(
+                        modifier = Modifier.size(44.dp).background(Color(0xFFEBE6FF), CircleShape),
+                        contentAlignment = Alignment.Center
+                    ) {
+                        Text(
+                            accountProfile.displayName.take(1).uppercase(Locale.getDefault()),
+                            color = Color(0xFF6C5CE7),
+                            fontWeight = FontWeight.Black
+                        )
+                    }
+                    Spacer(Modifier.width(12.dp))
+                    Column(modifier = Modifier.weight(1f)) {
+                        Text(accountProfile.displayName, color = Color(0xFF1E1C2E), fontWeight = FontWeight.Bold)
+                        accountProfile.email?.let {
+                            Text(it, color = Color(0xFF7E7E9A), fontSize = 11.sp, maxLines = 1)
+                        }
+                        Text("Device identity bound to verified account", color = Color(0xFF00A884), fontSize = 10.sp)
+                    }
+                    TextButton(onClick = onSignOut) {
+                        Icon(Icons.Default.Logout, contentDescription = null, modifier = Modifier.size(16.dp))
+                        Spacer(Modifier.width(5.dp))
+                        Text("SIGN OUT", fontWeight = FontWeight.Bold, fontSize = 11.sp)
+                    }
+                }
+            }
+        }
+
         if (permissionPlan.permissionGroups.isNotEmpty()) {
             item {
                 Text(

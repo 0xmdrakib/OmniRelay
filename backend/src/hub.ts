@@ -45,6 +45,14 @@ export class RealtimeHub {
     if (set?.size === 0) this.sockets.delete(deviceId);
   }
 
+  disconnectDevice(deviceId: string): void {
+    const sockets = this.sockets.get(deviceId);
+    if (!sockets) return;
+    this.sockets.delete(deviceId);
+    this.totalSockets = Math.max(0, this.totalSockets - sockets.size);
+    for (const socket of sockets) this.closeSocket(socket, 1000, "session revoked");
+  }
+
   size(): number {
     return this.totalSockets;
   }

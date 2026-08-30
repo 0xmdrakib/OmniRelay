@@ -29,6 +29,10 @@ not an application limitation.
 - Backend registration requires both an Ed25519 challenge signature and an
   ephemeral-DH proof of the Secret Link's X25519 private key, followed by
   bearer-token rotation.
+- Registration also requires a revoked-token-aware Firebase ID-token check on
+  both challenge and completion. The verified UID is bound into the challenge
+  and permanently associated with the device identity; another account cannot
+  rebind it. Existing pre-release unbound rows may bind once with valid key proof.
 - Each device synchronizes an inbound allow-list derived from mutual X25519 pair
   secrets. Senders present a direction-specific route capability; PostgreSQL
   stores only its SHA-256 hash. Registration alone does not authorize mailbox traffic.
@@ -63,10 +67,10 @@ not an application limitation.
 
 ## Security boundaries
 
-The backend stores device IDs, public keys, push routing IDs, hashed inbound
+The backend stores verified Firebase account UIDs, device IDs, public keys, push routing IDs, hashed inbound
 route capabilities and their sender/recipient device-ID relationship, call state,
 and opaque encrypted OmniFrames. Contact names, message plaintext, call audio,
-and private keys are never sent to it. Incoming frames are accepted only after
+Google email/profile fields, and private keys are never sent to it. Incoming frames are accepted only after
 the authenticated sender key resolves to a locally paired contact.
 
 Nearby volunteer phones see a random capsule identifier, a pseudorandom route
@@ -91,16 +95,18 @@ release gates, not hidden assumptions; see [Security evolution](SECURITY_EVOLUTI
 
 ## Server routes
 
-- `POST /v1/devices/challenge`
-- `POST /v1/devices/register`
+- `POST /v1/devices/challenge` (Firebase account bearer required)
+- `POST /v1/devices/register` (same Firebase account bearer required)
 - `PUT /v1/devices/push-token`
+- `DELETE /v1/devices/session` (expires the device session and clears its push target)
 - `POST /v1/envelopes`
 - `GET /v1/mailbox`
 - `POST /v1/envelopes/:id/ack`
 - `POST /v1/calls/:id/state`
 - `POST /v1/calls/:id/token`
 - `GET /v1/stream` (WebSocket)
-- `GET /healthz`
+- `GET /healthz` (process/database liveness)
+- `GET /readyz` (database plus Firebase registration readiness)
 
 ## Transport and cost boundaries
 

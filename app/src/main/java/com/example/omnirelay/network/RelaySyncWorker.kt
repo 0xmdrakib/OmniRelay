@@ -6,6 +6,7 @@ import androidx.core.content.ContextCompat
 import androidx.work.CoroutineWorker
 import androidx.work.WorkerParameters
 import com.example.omnirelay.service.OmniRelayService
+import com.example.omnirelay.auth.FirebaseAccountSession
 import com.example.omnirelay.utils.SettingsManager
 
 class RelaySyncWorker(
@@ -15,6 +16,7 @@ class RelaySyncWorker(
     companion object { const val UNIQUE_NAME = "omnirelay-mailbox-sync" }
 
     override suspend fun doWork(): Result {
+        if (!FirebaseAccountSession.isSignedIn(applicationContext)) return Result.success()
         if (!SettingsManager(applicationContext, observeExternalChanges = false)
                 .isRelayModeEnabled
         ) return Result.success()

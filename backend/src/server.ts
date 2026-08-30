@@ -6,6 +6,12 @@ import helmet from "@fastify/helmet";
 import rateLimit from "@fastify/rate-limit";
 import { AccessToken } from "livekit-server-sdk";
 import { z } from "zod";
+import {
+  createAccountTokenVerifier,
+  isValidAccountUid,
+  MAX_FIREBASE_ID_TOKEN_LENGTH,
+  type AccountTokenVerifier
+} from "./account-auth.js";
 import { config } from "./config.js";
 import { BoundedTaskQueue } from "./bounded-task-queue.js";
 import {
@@ -108,6 +114,7 @@ export type BuildServerOptions = {
   cleanupIntervalMs?: number;
   cleanupBatchSize?: number;
   pushGateway?: PushGateway;
+  accountTokenVerifier?: AccountTokenVerifier;
 };
 
 function bearerToken(request: FastifyRequest): string | null {
@@ -115,6 +122,28 @@ function bearerToken(request: FastifyRequest): string | null {
   if (!header?.startsWith("Bearer ")) return null;
   const token = header.slice(7).trim();
   return token.length > 0 ? token : null;
+}
+
+function accountBearerToken(request: FastifyRequest): string | null {
+  const header = request.headers.authorization;
+  const match = typeof header === "string" ? /^Bearer ([^\s]+)$/i.exec(header) : null;
+  const token = match?.[1];
+  return token && token.length <= MAX_FIREBASE_ID_TOKEN_LENGTH ? token : null;
+}
+
+async function authenticatedAccountUid(
+  request: FastifyRequest,
+  verifier: AccountTokenVerifier
+): Promise<string | null> {
+  const token = accountBearerToken(request);
+  if (!token) return null;
+  try {
+    const uid = await verifier.verifyIdToken(token);
+    return isValidAccountUid(uid) ? uid : null;
+  } catch {
+    // Account tokens and verifier errors are intentionally never logged.
+    return null;
+  }
 }
 
 async function authenticatedDevice(request: FastifyRequest, repository: Repository): Promise<Device | null> {
@@ -153,7 +182,12 @@ export async function buildServer(repository = createRepository(), overrides: Bu
   });
   app.server.maxConnections = runtime.httpMaxConnections;
   const hub = new RealtimeHub(runtime.maxWebSocketConnections);
+  const accountTokens = overrides.accountTokenVerifier ??
+    createAccountTokenVerifier(config.FIREBASE_SERVICE_ACCOUNT_JSON);
   const push = overrides.pushGateway ?? createPushGateway(config.FIREBASE_SERVICE_ACCOUNT_JSON);
+  if (!accountTokens.configured) {
+    app.log.warn("Firebase Admin is not configured; new device registration is disabled");
+  }
   const pushTasks = new BoundedTaskQueue(
     runtime.pushConcurrency,
     runtime.pushMaxQueued,
@@ -211,14 +245,30 @@ export async function buildServer(repository = createRepository(), overrides: Bu
     return reply.send({ status: "ok" });
   });
 
+  app.get("/readyz", async (_request, reply) => {
+    if (!accountTokens.configured) {
+      return reply.code(503).send({ status: "not_ready", registration: "disabled" });
+    }
+    await repository.health();
+    return reply.send({ status: "ready" });
+  });
+
   app.post("/v1/devices/challenge", { config: { rateLimit: { max: 20, timeWindow: "1 minute" } } }, async (request, reply) => {
+    const accountUid = await authenticatedAccountUid(request, accountTokens);
+    if (!accountUid) return reply.code(401).send({ error: "invalid_account_token" });
     const parsed = challengeSchema.safeParse(request.body);
     if (!parsed.success) return reply.code(400).send({ error: "invalid_request" });
     let deviceId: string;
     try { deviceId = deviceIdForPublicKey(parsed.data.publicKeyBase64); } catch {
       return reply.code(400).send({ error: "invalid_public_key" });
     }
-    const pinnedSigningKey = await repository.signingPublicKeyForDevice(deviceId);
+    const [pinnedSigningKey, boundAccountUid] = await Promise.all([
+      repository.signingPublicKeyForDevice(deviceId),
+      repository.accountUidForDevice(deviceId)
+    ]);
+    if (boundAccountUid && boundAccountUid !== accountUid) {
+      return reply.code(409).send({ error: "device_account_mismatch" });
+    }
     if (pinnedSigningKey && pinnedSigningKey !== parsed.data.signingPublicKeyBase64) {
       return reply.code(409).send({ error: "signing_identity_mismatch" });
     }
@@ -233,11 +283,13 @@ export async function buildServer(repository = createRepository(), overrides: Bu
     const saved = await repository.saveRegistrationChallenge(
       challengeId,
       deviceId,
+      accountUid,
       parsed.data.publicKeyBase64,
       parsed.data.signingPublicKeyBase64,
       nonceBase64,
       x25519Challenge.expectedProofBase64,
-      config.MAX_REGISTRATION_CHALLENGES_PER_DEVICE
+      config.MAX_REGISTRATION_CHALLENGES_PER_DEVICE,
+      config.MAX_REGISTRATION_CHALLENGES_PER_ACCOUNT
     );
     if (!saved) {
       return reply.header("Retry-After", "300").code(429).send({ error: "registration_challenge_limit" });
@@ -251,6 +303,8 @@ export async function buildServer(repository = createRepository(), overrides: Bu
   });
 
   app.post("/v1/devices/register", { config: { rateLimit: { max: 20, timeWindow: "1 minute" } } }, async (request, reply) => {
+    const accountUid = await authenticatedAccountUid(request, accountTokens);
+    if (!accountUid) return reply.code(401).send({ error: "invalid_account_token" });
     const parsed = registerSchema.safeParse(request.body);
     if (!parsed.success) return reply.code(400).send({ error: "invalid_request" });
     let deviceId: string;
@@ -260,7 +314,8 @@ export async function buildServer(repository = createRepository(), overrides: Bu
       return reply.code(400).send({ error: "invalid_public_key" });
     }
     const challenge = await repository.registrationChallenge(parsed.data.challengeId, deviceId);
-    if (!challenge || challenge.nonceBase64 !== parsed.data.nonceBase64 ||
+    if (!challenge || challenge.accountUid !== accountUid ||
+        challenge.nonceBase64 !== parsed.data.nonceBase64 ||
         challenge.publicKeyBase64 !== parsed.data.publicKeyBase64 ||
         challenge.signingPublicKeyBase64 !== parsed.data.signingPublicKeyBase64 ||
         !x25519RegistrationProofMatches(
@@ -275,16 +330,26 @@ export async function buildServer(repository = createRepository(), overrides: Bu
         )) {
       return reply.code(401).send({ error: "invalid_registration_proof" });
     }
-    const consumed = await repository.consumeRegistrationChallenge(parsed.data.challengeId, deviceId);
+    const consumed = await repository.consumeRegistrationChallenge(
+      parsed.data.challengeId,
+      deviceId,
+      accountUid
+    );
     if (!consumed) return reply.code(401).send({ error: "invalid_registration_proof" });
     const token = issueDeviceToken();
     const registered = await repository.registerOrRotate(
       deviceId,
+      accountUid,
       parsed.data.publicKeyBase64,
       parsed.data.signingPublicKeyBase64,
       token
     );
-    if (!registered) return reply.code(409).send({ error: "signing_identity_mismatch" });
+    if (registered === "signing_identity_mismatch") {
+      return reply.code(409).send({ error: "signing_identity_mismatch" });
+    }
+    if (registered === "account_mismatch") {
+      return reply.code(409).send({ error: "device_account_mismatch" });
+    }
     if (parsed.data.fcmToken) await repository.setFcmToken(deviceId, parsed.data.fcmToken);
     return reply.code(201).send({ deviceId, token });
   });
@@ -295,6 +360,14 @@ export async function buildServer(repository = createRepository(), overrides: Bu
     const parsed = pushTokenSchema.safeParse(request.body);
     if (!parsed.success) return reply.code(400).send({ error: "invalid_request" });
     await repository.setFcmToken(device.deviceId, parsed.data.fcmToken);
+    return reply.code(204).send();
+  });
+
+  app.delete("/v1/devices/session", async (request, reply) => {
+    const device = await authenticatedDevice(request, repository);
+    if (!device) return reply.code(401).send({ error: "unauthorized" });
+    await repository.revokeSession(device.deviceId);
+    hub.disconnectDevice(device.deviceId);
     return reply.code(204).send();
   });
 

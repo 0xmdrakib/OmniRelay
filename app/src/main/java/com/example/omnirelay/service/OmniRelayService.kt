@@ -26,6 +26,8 @@ import androidx.work.WorkManager
 import androidx.core.app.NotificationCompat
 import androidx.core.app.Person
 import com.example.omnirelay.MainActivity
+import com.example.omnirelay.auth.AccountAuthenticationRequiredException
+import com.example.omnirelay.auth.FirebaseAccountSession
 import com.example.omnirelay.data.local.MessageEntity
 import com.example.omnirelay.data.local.OmniDatabase
 import com.example.omnirelay.data.local.OutboundEnvelopeEntity
@@ -184,6 +186,12 @@ class OmniRelayService : Service() {
     override fun onCreate() {
         super.onCreate()
         createNotificationChannels()
+        if (!FirebaseAccountSession.isSignedIn(this)) {
+            initializationFailed = true
+            Log.i(TAG, "Service startup skipped until Google authentication completes")
+            stopSelf()
+            return
+        }
         settingsManager = SettingsManager(this)
         resourceMonitor = AndroidResourceMonitor(this)
         keyPair = try {
@@ -745,18 +753,23 @@ class OmniRelayService : Service() {
     }
 
     private fun initializeInternetRelay() {
-        if (!relayClient.isConfigured || !settingsManager.isRelayModeEnabled) return
+        if (!relayClient.isConfigured || !settingsManager.isRelayModeEnabled ||
+            !FirebaseAccountSession.isSignedIn(this)
+        ) return
         serviceScope.launch { establishInternetSession() }
     }
 
     private suspend fun ensureInternetRegistration(fcmToken: String?) {
+        val accountToken = FirebaseAccountSession.idToken(this)
         val signingIdentity = settingsManager.getMySigningIdentity()
         try {
             relayClient.ensureRegistered(
                 keyPair,
                 signingIdentity,
                 fcmToken,
-                pairedPublicKeys()
+                pairedPublicKeys(),
+                accountToken.uid,
+                accountToken.idToken
             )
         } finally {
             signingIdentity.privateKeyDer.fill(0)
@@ -776,7 +789,7 @@ class OmniRelayService : Service() {
         }.onFailure {
             router.updatePathTelemetry(TransportPath.CELLULAR_CONTROL, false, 999, 1f, -127)
             Log.w(TAG, "Internet relay initialization deferred", it)
-            scheduleRelayRetry()
+            if (it !is AccountAuthenticationRequiredException) scheduleRelayRetry()
         }
     }
 
@@ -787,7 +800,7 @@ class OmniRelayService : Service() {
             relayClient.updatePushToken(token)
         }.onFailure {
             Log.w(TAG, "Unable to update FCM token", it)
-            scheduleRelayRetry()
+            if (it !is AccountAuthenticationRequiredException) scheduleRelayRetry()
         }
     }
 
@@ -841,7 +854,7 @@ class OmniRelayService : Service() {
                 envelopeId,
                 System.currentTimeMillis() + 5_000
             )
-            scheduleRelayRetry()
+            if (it !is AccountAuthenticationRequiredException) scheduleRelayRetry()
             false
         }
     }
@@ -1036,7 +1049,9 @@ class OmniRelayService : Service() {
     }
 
     private fun scheduleRelayRetry() {
-        if (!relayClient.isConfigured || !settingsManager.isRelayModeEnabled) return
+        if (!relayClient.isConfigured || !settingsManager.isRelayModeEnabled ||
+            !FirebaseAccountSession.isSignedIn(this)
+        ) return
         val request = OneTimeWorkRequestBuilder<RelaySyncWorker>()
             .setConstraints(Constraints.Builder().setRequiredNetworkType(NetworkType.CONNECTED).build())
             .setBackoffCriteria(BackoffPolicy.EXPONENTIAL, 15, TimeUnit.SECONDS)
