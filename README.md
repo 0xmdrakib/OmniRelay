@@ -1,4 +1,8 @@
-# OmniRelay
+<p align="center">
+  <img src="brand/omnirelay-app-icon.svg" alt="OmniRelay logo" width="112" />
+</p>
+
+<h1 align="center">OmniRelay</h1>
 
 OmniRelay is a native Android app for private, end-to-end encrypted messaging
 and voice calls, with a self-hosted internet relay and nearby radio fallback.

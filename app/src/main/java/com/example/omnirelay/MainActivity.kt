@@ -15,6 +15,7 @@ import androidx.core.content.ContextCompat
 import androidx.compose.animation.*
 import androidx.compose.animation.core.*
 import androidx.compose.foundation.Canvas
+import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
@@ -40,6 +41,7 @@ import androidx.compose.ui.draw.shadow
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
@@ -402,13 +404,16 @@ fun GoogleSignInScreen(
                 Box(
                     modifier = Modifier
                         .size(64.dp)
-                        .background(
-                            Brush.linearGradient(listOf(Color(0xFF7C66FF), Color(0xFF6C5CE7))),
-                            RoundedCornerShape(20.dp)
-                        ),
+                        .clip(RoundedCornerShape(20.dp))
+                        .background(Color(0xFFFFFAF0))
+                        .border(1.dp, Color(0xFFE7E0D5), RoundedCornerShape(20.dp)),
                     contentAlignment = Alignment.Center
                 ) {
-                    Icon(Icons.Default.CellTower, contentDescription = null, tint = Color.White, modifier = Modifier.size(32.dp))
+                    Image(
+                        painter = painterResource(R.drawable.ic_brand_mark),
+                        contentDescription = "OmniRelay",
+                        modifier = Modifier.size(42.dp)
+                    )
                 }
                 Spacer(Modifier.height(20.dp))
                 Text("Welcome to OmniRelay", fontWeight = FontWeight.Black, fontSize = 24.sp, color = Color(0xFF1E1C2E))
@@ -563,10 +568,15 @@ fun MinimalAppDashboard(
                         modifier = Modifier
                             .size(42.dp)
                             .clip(RoundedCornerShape(14.dp))
-                            .background(Brush.linearGradient(listOf(Color(0xFF7C66FF), Color(0xFF6C5CE7)))),
+                            .background(Color(0xFFFFFAF0))
+                            .border(1.dp, Color(0xFFE7E0D5), RoundedCornerShape(14.dp)),
                         contentAlignment = Alignment.Center
                     ) {
-                        Icon(Icons.Default.CellTower, contentDescription = null, tint = Color.White, modifier = Modifier.size(22.dp))
+                        Image(
+                            painter = painterResource(R.drawable.ic_brand_mark),
+                            contentDescription = null,
+                            modifier = Modifier.size(29.dp)
+                        )
                     }
                     Spacer(modifier = Modifier.width(12.dp))
                     Column {

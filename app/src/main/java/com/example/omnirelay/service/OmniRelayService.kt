@@ -26,6 +26,7 @@ import androidx.work.WorkManager
 import androidx.core.app.NotificationCompat
 import androidx.core.app.Person
 import com.example.omnirelay.MainActivity
+import com.example.omnirelay.R
 import com.example.omnirelay.auth.AccountAuthenticationRequiredException
 import com.example.omnirelay.auth.FirebaseAccountSession
 import com.example.omnirelay.data.local.MessageEntity
@@ -1364,7 +1365,7 @@ class OmniRelayService : Service() {
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
         )
         val notification = NotificationCompat.Builder(this, MSG_CHANNEL_ID)
-            .setSmallIcon(android.R.drawable.stat_sys_warning)
+            .setSmallIcon(R.drawable.ic_notification)
             .setContentTitle("OmniRelay identity locked")
             .setContentText("Open OmniRelay for recovery guidance. Networking was stopped safely.")
             .setContentIntent(openApp)
@@ -1405,7 +1406,7 @@ class OmniRelayService : Service() {
         val notification = NotificationCompat.Builder(this, CHANNEL_ID)
             .setContentTitle(if (includeMicrophone) "OmniRelay call active" else "OmniRelay nearby service active")
             .setContentText(if (includeMicrophone) "Encrypted voice session in progress" else "Listening for paired nearby devices")
-            .setSmallIcon(android.R.drawable.stat_sys_data_bluetooth)
+            .setSmallIcon(R.drawable.ic_notification)
             .setContentIntent(pendingIntent)
             .setOngoing(true)
             .build()
@@ -1437,7 +1438,7 @@ class OmniRelayService : Service() {
         )
         val caller = Person.Builder().setName(callerId).setImportant(true).build()
         val notification = NotificationCompat.Builder(this, CALL_CHANNEL_ID)
-            .setSmallIcon(android.R.drawable.sym_call_incoming)
+            .setSmallIcon(R.drawable.ic_notification)
             .setContentIntent(contentIntent)
             .setPriority(NotificationCompat.PRIORITY_MAX)
             .setVisibility(NotificationCompat.VISIBILITY_PRIVATE)
@@ -1455,7 +1456,7 @@ class OmniRelayService : Service() {
             this, 4, Intent(this, MainActivity::class.java), PendingIntent.FLAG_IMMUTABLE
         )
         val notification = NotificationCompat.Builder(this, MSG_CHANNEL_ID)
-            .setSmallIcon(android.R.drawable.stat_notify_chat)
+            .setSmallIcon(R.drawable.ic_notification)
             .setContentTitle(senderId)
             .setContentText(text)
             .setPriority(NotificationCompat.PRIORITY_HIGH)
