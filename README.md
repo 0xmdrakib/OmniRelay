@@ -82,20 +82,6 @@ exists.
 - **Infrastructure:** Docker Compose, Caddy TLS, and GitHub Actions
 - **Public showcase:** isolated static Vite site under `website/`, configured for Vercel
 
-## Documentation
-
-- [Setup and deployment](docs/SETUP.md) — prerequisites, local testing, Firebase,
-  signing, production setup, and test commands
-- [Production architecture](docs/PRODUCTION_ARCHITECTURE.md) — delivery paths,
-  components, API routes, and security boundaries
-- [Threat model](docs/THREAT_MODEL.md) — protections, trust boundaries, and limitations
-- [Security evolution](docs/SECURITY_EVOLUTION.md) — current v2 guarantees and
-  the ratcheted-session roadmap
-- [Release checklist](docs/RELEASE_CHECKLIST.md) — infrastructure, device validation,
-  security review, and distribution
-
----
-
 ## License
 
 Copyright (c) 2026 OmniRelay. All rights reserved.
