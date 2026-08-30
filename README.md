@@ -5,6 +5,8 @@ and voice calls, with a self-hosted internet relay and nearby radio fallback.
 
 **Status:** Pre-release · Android 8.0+ · Physical-device validation pending
 
+**Official website:** [omnirelay.rakibhq.xyz](https://omnirelay.rakibhq.xyz)
+
 ---
 
 ## Overview
@@ -84,7 +86,7 @@ exists.
 
 ## Getting started
 
-Clone the private repository using an account with access:
+Clone the repository:
 
 ```powershell
 git clone https://github.com/0xmdrakib/OmniRelay.git
@@ -96,12 +98,13 @@ configured APK, and pair two Android phones. For a public server, use the
 [production deployment guide](docs/SETUP.md#production-deployment).
 
 Credentials, signing keys, local configuration, and build artifacts stay outside
-Git. Keep the repository private and store deployment secrets on the server or
-in a secrets manager.
+Git. Never commit deployment secrets; store them on the server or in a secrets
+manager.
 
-The public showcase is built only from [`website/`](website/). Configure that
-folder as the Vercel project Root Directory; its production bundle contains no
-Android or backend source. APK buttons point to the official GitHub Releases page.
+The [public showcase](https://omnirelay.rakibhq.xyz) is built only from
+[`website/`](website/). Configure that folder as the Vercel project Root
+Directory; its production bundle contains no Android or backend source. APK
+buttons point to the official GitHub Releases page.
 
 ## Testing and release
 

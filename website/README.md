@@ -16,4 +16,4 @@ a private GitHub repository is not accessible to public visitors, so the release
 or release asset must be public before launch.
 
 Set `VITE_PUBLIC_SITE_URL` to the final Vercel or custom HTTPS origin so Open Graph and X
-preview images use the correct absolute URL. It defaults to `https://omnirelay.vercel.app`.
+preview images use the correct absolute URL. It defaults to `https://omnirelay.rakibhq.xyz`.

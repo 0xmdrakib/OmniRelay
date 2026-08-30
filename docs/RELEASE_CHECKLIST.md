@@ -74,8 +74,8 @@
 - [ ] Deploy only `website/` as the Vercel Root Directory and inspect the public
       bundle for application/backend source or secrets.
 - [ ] Set the final canonical/social URL and verify the generated preview card.
-- [ ] Publish the signed APK on a publicly accessible GitHub Release; Releases in
-      a private repository cannot serve anonymous website visitors.
+- [ ] Publish the signed APK on a publicly accessible GitHub Release and verify
+      that the website download link works in an anonymous browser session.
 - [ ] Build a signed AAB from a clean checkout and pinned commit.
 - [ ] Verify signing certificate fingerprints and archive the mapping file.
 - [ ] Complete Play Console Data Safety, foreground-service, full-screen-intent,

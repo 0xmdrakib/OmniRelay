@@ -2,7 +2,7 @@ import { defineConfig, loadEnv } from "vite";
 
 export default defineConfig(({ mode }) => {
   const env = loadEnv(mode, process.cwd(), "VITE_");
-  const publicSiteUrl = (env.VITE_PUBLIC_SITE_URL || "https://omnirelay.vercel.app")
+  const publicSiteUrl = (env.VITE_PUBLIC_SITE_URL || "https://omnirelay.rakibhq.xyz")
     .replace(/\/+$/, "");
   if (!/^https:\/\/[^\s/]+(?:\/[^\s]*)?$/.test(publicSiteUrl)) {
     throw new Error("VITE_PUBLIC_SITE_URL must be an absolute HTTPS URL");

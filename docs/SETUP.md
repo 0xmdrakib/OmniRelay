@@ -8,7 +8,7 @@ Android release configuration, and automated checks.
 
 ## Prerequisites
 
-- Git access to the private repository
+- Git
 - JDK 17 and Android SDK 36 for Android builds; use the included Gradle wrapper
 - Docker with Compose for the backend, database, LiveKit, and coturn
 - PowerShell for the commands below; use PowerShell 7 on a Linux server
