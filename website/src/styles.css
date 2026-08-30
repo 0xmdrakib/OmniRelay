@@ -53,7 +53,7 @@ p { line-height: 1.6; }
 
 .site-header { position: sticky; top: 0; z-index: 50; height: 72px; background: color-mix(in srgb, var(--canvas) 92%, transparent); border-bottom: 1px solid color-mix(in srgb, var(--hairline) 70%, transparent); backdrop-filter: blur(18px); }
 .nav-shell { width: min(calc(100% - 48px), var(--max-width)); height: 100%; margin-inline: auto; display: flex; align-items: center; justify-content: space-between; }
-.brand { display: inline-flex; align-items: center; gap: 11px; color: var(--ink); font-size: 18px; font-weight: 650; letter-spacing: -0.03em; }
+.brand { min-height: 44px; display: inline-flex; align-items: center; gap: 11px; color: var(--ink); font-size: 18px; font-weight: 650; letter-spacing: -0.03em; }
 .brand img { flex: 0 0 auto; }
 .site-nav { display: flex; align-items: center; gap: 30px; color: var(--body-strong); font-size: 14px; font-weight: 520; }
 .site-nav a { min-height: 44px; display: inline-flex; align-items: center; }
