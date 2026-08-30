@@ -38,7 +38,7 @@ for (const path of files) {
 }
 
 const index = await readFile(join(root, "index.html"), "utf8");
-for (const requiredAsset of ["logo-mark.svg", "icon-192.png", "icon-512.png", "apple-touch-icon.png"]) {
+for (const requiredAsset of ["omnirelay-monogram.svg", "icon-192.png", "icon-512.png", "apple-touch-icon.png"]) {
   await stat(join(root, requiredAsset)).catch(() => {
     throw new Error(`Required brand asset is missing: ${requiredAsset}`);
   });
@@ -47,8 +47,11 @@ if (!index.includes("github.com/0xmdrakib/OmniRelay/releases/latest")) {
   throw new Error("Official GitHub Releases link is missing");
 }
 if (!index.includes("omnirelay-clay-relay.jpg")) throw new Error("Social preview artwork is missing");
-if (!index.includes('rel="apple-touch-icon" href="/apple-touch-icon.png"')) {
+if (!index.includes('rel="apple-touch-icon" href="/apple-touch-icon.png?v=88464eb"')) {
   throw new Error("Apple touch icon is missing");
+}
+if ((index.match(/\/omnirelay-monogram\.svg/g) ?? []).length < 3) {
+  throw new Error("Versioned OmniRelay monogram references are incomplete");
 }
 if (index.includes("%PUBLIC_SITE_URL%")) throw new Error("Public site URL placeholder was not resolved");
 if (!index.includes('rel="canonical" href="https://')) throw new Error("Canonical HTTPS URL is missing");

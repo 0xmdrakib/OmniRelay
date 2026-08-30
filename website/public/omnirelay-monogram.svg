@@ -1,0 +1,10 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 108 108" role="img" aria-labelledby="title desc">
+  <title id="title">OmniRelay</title>
+  <desc id="desc">A geometric O and R monogram representing a protected relay path.</desc>
+  <path
+    fill="#0A0A0A"
+    d="M38 22h31c10 0 17 7 17 17v11c0 7-2 11-7 16l-10 10-9-9 9-9c2-2 3-5 3-8v-9c0-3-2-5-5-5H41c-3 0-5 2-5 5v26c0 3 2 5 5 5h11l14 14H39c-10 0-17-7-17-17V39c0-10 7-17 16-17Z" />
+  <path
+    fill="#0A0A0A"
+    d="M51 36h3c6 0 10 4 10 10v8c0 4 2 7 5 10l18 18c2 2 2 4 0 6l-2 2c-2 2-4 2-6 0L58 69c-5-5-7-10-7-16V36Z" />
+</svg>
