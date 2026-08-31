@@ -1,4 +1,14 @@
 export const schemaSql = `
+CREATE TABLE IF NOT EXISTS accounts (
+  account_uid TEXT PRIMARY KEY,
+  normalized_email TEXT UNIQUE NOT NULL,
+  plan_code TEXT NOT NULL DEFAULT 'free' CHECK (plan_code IN ('free', 'paid')),
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  CONSTRAINT accounts_uid_bounds CHECK (char_length(account_uid) BETWEEN 1 AND 128),
+  CONSTRAINT accounts_email_bounds CHECK (char_length(normalized_email) BETWEEN 3 AND 320)
+);
+
 CREATE TABLE IF NOT EXISTS devices (
   device_id TEXT PRIMARY KEY,
   public_key_base64 TEXT UNIQUE NOT NULL,
@@ -44,6 +54,35 @@ CREATE TABLE IF NOT EXISTS call_sessions (
   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
   updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
   expires_at TIMESTAMPTZ NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS active_call_participants (
+  device_id TEXT PRIMARY KEY REFERENCES devices(device_id) ON DELETE CASCADE,
+  call_id UUID NOT NULL REFERENCES call_sessions(call_id) ON DELETE CASCADE,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS contact_invitations (
+  invitation_id UUID PRIMARY KEY,
+  sender_account_uid TEXT NOT NULL REFERENCES accounts(account_uid) ON DELETE CASCADE,
+  sender_device_id TEXT NOT NULL REFERENCES devices(device_id) ON DELETE CASCADE,
+  recipient_account_uid TEXT NOT NULL REFERENCES accounts(account_uid) ON DELETE CASCADE,
+  recipient_device_id TEXT NOT NULL REFERENCES devices(device_id) ON DELETE CASCADE,
+  status TEXT NOT NULL DEFAULT 'pending'
+    CHECK (status IN ('pending', 'accepted', 'declined', 'cancelled')),
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  expires_at TIMESTAMPTZ NOT NULL DEFAULT (NOW() + INTERVAL '7 days'),
+  responded_at TIMESTAMPTZ,
+  CHECK (sender_account_uid <> recipient_account_uid)
+);
+
+CREATE TABLE IF NOT EXISTS account_contacts (
+  account_low_uid TEXT NOT NULL REFERENCES accounts(account_uid) ON DELETE CASCADE,
+  account_high_uid TEXT NOT NULL REFERENCES accounts(account_uid) ON DELETE CASCADE,
+  invited_by_account_uid TEXT NOT NULL REFERENCES accounts(account_uid) ON DELETE CASCADE,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  PRIMARY KEY (account_low_uid, account_high_uid),
+  CHECK (account_low_uid < account_high_uid)
 );
 
 CREATE TABLE IF NOT EXISTS envelopes (
@@ -133,6 +172,22 @@ CREATE INDEX IF NOT EXISTS envelopes_rejected_cleanup_idx ON envelopes(rejected_
 CREATE INDEX IF NOT EXISTS call_sessions_participants_idx
   ON call_sessions(caller_id, callee_id, updated_at DESC);
 CREATE INDEX IF NOT EXISTS call_sessions_expiry_idx ON call_sessions(expires_at);
+CREATE INDEX IF NOT EXISTS active_call_participants_call_idx
+  ON active_call_participants(call_id);
+CREATE UNIQUE INDEX IF NOT EXISTS contact_invitations_pending_pair_idx
+  ON contact_invitations(
+    LEAST(sender_account_uid, recipient_account_uid),
+    GREATEST(sender_account_uid, recipient_account_uid)
+  ) WHERE status = 'pending';
+CREATE INDEX IF NOT EXISTS contact_invitations_recipient_idx
+  ON contact_invitations(recipient_account_uid, created_at DESC)
+  WHERE status = 'pending';
+CREATE INDEX IF NOT EXISTS contact_invitations_sender_day_idx
+  ON contact_invitations(sender_account_uid, created_at DESC);
+CREATE INDEX IF NOT EXISTS account_contacts_low_idx
+  ON account_contacts(account_low_uid, created_at DESC);
+CREATE INDEX IF NOT EXISTS account_contacts_high_idx
+  ON account_contacts(account_high_uid, created_at DESC);
 UPDATE call_sessions
 SET expires_at = NOW() + INTERVAL '120 seconds', updated_at = NOW()
 WHERE state = 'active' AND expires_at > NOW() + INTERVAL '120 seconds';
@@ -144,6 +199,17 @@ CREATE INDEX IF NOT EXISTS registration_challenges_account_idx
   ON registration_challenges(account_uid, created_at);
 CREATE INDEX IF NOT EXISTS devices_account_uid_idx
   ON devices(account_uid) WHERE account_uid IS NOT NULL;
+
+DELETE FROM active_call_participants AS participant
+WHERE NOT EXISTS (
+  SELECT 1 FROM call_sessions AS call
+  WHERE call.call_id = participant.call_id
+    AND call.state = 'active' AND call.expires_at > NOW()
+);
+
+UPDATE contact_invitations
+SET status = 'cancelled', responded_at = NOW()
+WHERE status = 'pending' AND expires_at <= NOW();
 
 ALTER TABLE devices ADD COLUMN IF NOT EXISTS token_expires_at TIMESTAMPTZ;
 UPDATE devices SET token_expires_at = NOW() + INTERVAL '30 days' WHERE token_expires_at IS NULL;

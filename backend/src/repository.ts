@@ -1,5 +1,5 @@
 import pg from "pg";
-import { isValidAccountUid } from "./account-auth.js";
+import { isValidAccountUid, normalizeVerifiedEmail } from "./account-auth.js";
 import { hashToken, tokenMatches } from "./identity.js";
 import {
   isCanonicalDeviceId,
@@ -55,7 +55,32 @@ export type CallRingEnvelopeResult =
   | "expired";
 export type CallTransitionEnvelopeResult =
   | { status: "inserted" | "duplicate"; otherDeviceId: string }
-  | { status: "envelope_conflict" | "invalid" | "not_found" };
+  | { status: "envelope_conflict" | "invalid" | "not_found" | "participant_busy" };
+
+export type ContactInvitation = {
+  invitationId: string;
+  direction: "incoming" | "outgoing";
+  counterpartAccountUid: string;
+  counterpartEmail: string;
+  createdAt: string;
+  expiresAt: string;
+};
+
+export type AccountContact = {
+  accountUid: string;
+  email: string;
+  deviceId: string | null;
+  publicKeyBase64: string | null;
+};
+
+export type CreateContactInvitationResult =
+  | { status: "created"; invitationId: string; recipientDeviceIds: string[]; remainingToday: number }
+  | { status: "already_pending"; invitationId: string }
+  | { status: "already_contact" | "recipient_unavailable" | "daily_limit" | "contact_limit" | "self" };
+
+export type RespondContactInvitationResult =
+  | { status: "accepted" | "declined"; otherDeviceIds: string[] }
+  | { status: "not_found" | "expired" | "contact_limit" };
 
 export type InboundRoute = {
   senderId: string;
@@ -287,6 +312,318 @@ export class Repository {
   async accountUidForDevice(deviceId: string): Promise<string | null> {
     const result = await this.pool.query("SELECT account_uid FROM devices WHERE device_id = $1", [deviceId]);
     return result.rows[0]?.account_uid ?? null;
+  }
+
+  async upsertAccount(accountUid: string, verifiedEmail: string): Promise<boolean> {
+    const email = normalizeVerifiedEmail(verifiedEmail);
+    if (!isValidAccountUid(accountUid) || !email) throw new Error("invalid verified account");
+    try {
+      const result = await this.pool.query(
+        `INSERT INTO accounts(account_uid, normalized_email)
+         VALUES ($1, $2)
+         ON CONFLICT (account_uid) DO UPDATE
+           SET normalized_email = EXCLUDED.normalized_email, updated_at = NOW()
+           WHERE accounts.normalized_email = EXCLUDED.normalized_email
+         RETURNING account_uid`,
+        [accountUid, email]
+      );
+      return result.rowCount === 1;
+    } catch (error) {
+      if ((error as { code?: unknown })?.code === "23505") return false;
+      throw error;
+    }
+  }
+
+  async createContactInvitation(
+    invitationId: string,
+    senderAccountUid: string,
+    senderDeviceId: string,
+    recipientEmail: string,
+    dailyLimit: number,
+    contactLimit: number
+  ): Promise<CreateContactInvitationResult> {
+    const email = normalizeVerifiedEmail(recipientEmail);
+    if (!isValidAccountUid(senderAccountUid) || !isCanonicalDeviceId(senderDeviceId) || !email) {
+      throw new Error("invalid contact invitation input");
+    }
+    if (!Number.isInteger(dailyLimit) || dailyLimit < 1 ||
+        !Number.isInteger(contactLimit) || contactLimit < 1) {
+      throw new Error("invalid contact limits");
+    }
+    const client = await this.pool.connect();
+    try {
+      await client.query("BEGIN");
+      const recipient = await client.query(
+        "SELECT account_uid FROM accounts WHERE normalized_email = $1",
+        [email]
+      );
+      const recipientAccountUid = recipient.rows[0]?.account_uid as string | undefined;
+      if (!recipientAccountUid) {
+        await client.query("ROLLBACK");
+        return { status: "recipient_unavailable" };
+      }
+      if (recipientAccountUid === senderAccountUid) {
+        await client.query("ROLLBACK");
+        return { status: "self" };
+      }
+      const pair = [senderAccountUid, recipientAccountUid].sort();
+      for (const accountUid of pair) {
+        await client.query("SELECT pg_advisory_xact_lock(hashtext($1))", [`contacts:${accountUid}`]);
+      }
+      await client.query(
+        `UPDATE contact_invitations SET status = 'cancelled', responded_at = NOW()
+         WHERE status = 'pending' AND expires_at <= NOW()
+           AND (sender_account_uid = ANY($1::text[]) OR recipient_account_uid = ANY($1::text[]))`,
+        [pair]
+      );
+      const existingContact = await client.query(
+        `SELECT 1 FROM account_contacts
+         WHERE account_low_uid = $1 AND account_high_uid = $2`,
+        pair
+      );
+      if (existingContact.rowCount) {
+        await client.query("ROLLBACK");
+        return { status: "already_contact" };
+      }
+      const existingInvitation = await client.query(
+        `SELECT invitation_id FROM contact_invitations
+         WHERE status = 'pending' AND expires_at > NOW()
+           AND LEAST(sender_account_uid, recipient_account_uid) = $1
+           AND GREATEST(sender_account_uid, recipient_account_uid) = $2
+         LIMIT 1`,
+        pair
+      );
+      if (existingInvitation.rows[0]) {
+        await client.query("COMMIT");
+        return {
+          status: "already_pending",
+          invitationId: existingInvitation.rows[0].invitation_id
+        };
+      }
+      const contactCount = await client.query(
+        `SELECT COUNT(*)::integer AS count FROM account_contacts
+         WHERE account_low_uid = $1 OR account_high_uid = $1`,
+        [senderAccountUid]
+      );
+      if ((contactCount.rows[0]?.count ?? contactLimit) >= contactLimit) {
+        await client.query("ROLLBACK");
+        return { status: "contact_limit" };
+      }
+      const dailyCount = await client.query(
+        `SELECT COUNT(*)::integer AS count FROM contact_invitations
+         WHERE sender_account_uid = $1
+           AND created_at >= date_trunc('day', NOW() AT TIME ZONE 'UTC') AT TIME ZONE 'UTC'`,
+        [senderAccountUid]
+      );
+      const sentToday = dailyCount.rows[0]?.count ?? dailyLimit;
+      if (sentToday >= dailyLimit) {
+        await client.query("ROLLBACK");
+        return { status: "daily_limit" };
+      }
+      const recipientDevices = await client.query(
+        `SELECT device_id FROM devices
+         WHERE account_uid = $1 AND token_expires_at > NOW()
+         ORDER BY last_seen_at DESC LIMIT 8`,
+        [recipientAccountUid]
+      );
+      const recipientDeviceIds = recipientDevices.rows.map((row) => row.device_id as string);
+      if (recipientDeviceIds.length === 0) {
+        await client.query("ROLLBACK");
+        return { status: "recipient_unavailable" };
+      }
+      await client.query(
+        `INSERT INTO contact_invitations(
+           invitation_id, sender_account_uid, sender_device_id,
+           recipient_account_uid, recipient_device_id
+         ) VALUES ($1, $2, $3, $4, $5)`,
+        [invitationId, senderAccountUid, senderDeviceId, recipientAccountUid, recipientDeviceIds[0]]
+      );
+      await client.query("COMMIT");
+      return {
+        status: "created",
+        invitationId,
+        recipientDeviceIds,
+        remainingToday: Math.max(0, dailyLimit - sentToday - 1)
+      };
+    } catch (error) {
+      await client.query("ROLLBACK").catch(() => undefined);
+      throw error;
+    } finally {
+      client.release();
+    }
+  }
+
+  async contactInvitations(accountUid: string): Promise<ContactInvitation[]> {
+    if (!isValidAccountUid(accountUid)) throw new Error("invalid account UID");
+    const result = await this.pool.query(
+      `SELECT invitation.invitation_id,
+              CASE WHEN invitation.recipient_account_uid = $1 THEN 'incoming' ELSE 'outgoing' END AS direction,
+              CASE WHEN invitation.recipient_account_uid = $1
+                THEN invitation.sender_account_uid ELSE invitation.recipient_account_uid END AS counterpart_uid,
+              account.normalized_email AS counterpart_email,
+              invitation.created_at, invitation.expires_at
+       FROM contact_invitations AS invitation
+       JOIN accounts AS account ON account.account_uid = CASE
+         WHEN invitation.recipient_account_uid = $1
+           THEN invitation.sender_account_uid ELSE invitation.recipient_account_uid END
+       WHERE (invitation.sender_account_uid = $1 OR invitation.recipient_account_uid = $1)
+         AND invitation.status = 'pending' AND invitation.expires_at > NOW()
+       ORDER BY invitation.created_at DESC
+       LIMIT 100`,
+      [accountUid]
+    );
+    return result.rows.map((row) => ({
+      invitationId: row.invitation_id,
+      direction: row.direction,
+      counterpartAccountUid: row.counterpart_uid,
+      counterpartEmail: row.counterpart_email,
+      createdAt: new Date(row.created_at).toISOString(),
+      expiresAt: new Date(row.expires_at).toISOString()
+    }));
+  }
+
+  async respondContactInvitation(
+    invitationId: string,
+    recipientAccountUid: string,
+    recipientDeviceId: string,
+    accept: boolean,
+    contactLimit: number
+  ): Promise<RespondContactInvitationResult> {
+    if (!isValidAccountUid(recipientAccountUid) || !isCanonicalDeviceId(recipientDeviceId) ||
+        !Number.isInteger(contactLimit) || contactLimit < 1) {
+      throw new Error("invalid invitation response input");
+    }
+    const client = await this.pool.connect();
+    try {
+      await client.query("BEGIN");
+      const selected = await client.query(
+        `SELECT sender_account_uid, recipient_account_uid, expires_at > NOW() AS unexpired
+         FROM contact_invitations
+         WHERE invitation_id = $1 AND status = 'pending'
+         FOR UPDATE`,
+        [invitationId]
+      );
+      const invitation = selected.rows[0];
+      if (!invitation || invitation.recipient_account_uid !== recipientAccountUid) {
+        await client.query("ROLLBACK");
+        return { status: "not_found" };
+      }
+      if (invitation.unexpired !== true) {
+        await client.query(
+          `UPDATE contact_invitations SET status = 'cancelled', responded_at = NOW()
+           WHERE invitation_id = $1`,
+          [invitationId]
+        );
+        await client.query("COMMIT");
+        return { status: "expired" };
+      }
+      const pair = [invitation.sender_account_uid as string, recipientAccountUid].sort();
+      for (const accountUid of pair) {
+        await client.query("SELECT pg_advisory_xact_lock(hashtext($1))", [`contacts:${accountUid}`]);
+      }
+      if (accept) {
+        const counts = await client.query(
+          `SELECT account_uid, COUNT(contact_key)::integer AS count
+           FROM (
+             SELECT account_low_uid AS account_uid,
+                    account_low_uid || ':' || account_high_uid AS contact_key
+             FROM account_contacts WHERE account_low_uid = ANY($1::text[])
+             UNION ALL
+             SELECT account_high_uid AS account_uid,
+                    account_low_uid || ':' || account_high_uid AS contact_key
+             FROM account_contacts WHERE account_high_uid = ANY($1::text[])
+           ) AS contacts
+           GROUP BY account_uid`,
+          [pair]
+        );
+        const countByAccount = new Map<string, number>(
+          counts.rows.map((row) => [row.account_uid as string, row.count as number])
+        );
+        if (pair.some((accountUid) => (countByAccount.get(accountUid) ?? 0) >= contactLimit)) {
+          await client.query("ROLLBACK");
+          return { status: "contact_limit" };
+        }
+        await client.query(
+          `INSERT INTO account_contacts(
+             account_low_uid, account_high_uid, invited_by_account_uid
+           ) VALUES ($1, $2, $3)
+           ON CONFLICT (account_low_uid, account_high_uid) DO NOTHING`,
+          [pair[0], pair[1], invitation.sender_account_uid]
+        );
+      }
+      await client.query(
+        `UPDATE contact_invitations
+         SET status = $2, recipient_device_id = $3, responded_at = NOW()
+         WHERE invitation_id = $1`,
+        [invitationId, accept ? "accepted" : "declined", recipientDeviceId]
+      );
+      const devices = await client.query(
+        `SELECT device_id FROM devices
+         WHERE account_uid = $1 AND token_expires_at > NOW()
+         ORDER BY last_seen_at DESC LIMIT 8`,
+        [invitation.sender_account_uid]
+      );
+      await client.query("COMMIT");
+      return {
+        status: accept ? "accepted" : "declined",
+        otherDeviceIds: devices.rows.map((row) => row.device_id as string)
+      };
+    } catch (error) {
+      await client.query("ROLLBACK").catch(() => undefined);
+      throw error;
+    } finally {
+      client.release();
+    }
+  }
+
+  async accountContacts(accountUid: string): Promise<AccountContact[]> {
+    if (!isValidAccountUid(accountUid)) throw new Error("invalid account UID");
+    const result = await this.pool.query(
+      `SELECT other.account_uid, other.normalized_email,
+              device.device_id, device.public_key_base64
+       FROM (
+         SELECT CASE WHEN account_low_uid = $1 THEN account_high_uid ELSE account_low_uid END AS account_uid,
+                created_at
+         FROM account_contacts
+         WHERE account_low_uid = $1 OR account_high_uid = $1
+       ) AS contact
+       JOIN accounts AS other ON other.account_uid = contact.account_uid
+       LEFT JOIN LATERAL (
+         SELECT device_id, public_key_base64
+         FROM devices
+         WHERE account_uid = other.account_uid AND token_expires_at > NOW()
+         ORDER BY last_seen_at DESC LIMIT 1
+       ) AS device ON TRUE
+       ORDER BY contact.created_at DESC`,
+      [accountUid]
+    );
+    return result.rows.map((row) => ({
+      accountUid: row.account_uid,
+      email: row.normalized_email,
+      deviceId: row.device_id ?? null,
+      publicKeyBase64: row.public_key_base64 ?? null
+    }));
+  }
+
+  async removeAccountContact(accountUid: string, otherAccountUid: string): Promise<boolean> {
+    if (!isValidAccountUid(accountUid) || !isValidAccountUid(otherAccountUid) ||
+        accountUid === otherAccountUid) return false;
+    const pair = [accountUid, otherAccountUid].sort();
+    const result = await this.pool.query(
+      `DELETE FROM account_contacts WHERE account_low_uid = $1 AND account_high_uid = $2`,
+      pair
+    );
+    return result.rowCount === 1;
+  }
+
+  async activeDeviceIdsForAccount(accountUid: string): Promise<string[]> {
+    const result = await this.pool.query(
+      `SELECT device_id FROM devices
+       WHERE account_uid = $1 AND token_expires_at > NOW()
+       ORDER BY last_seen_at DESC LIMIT 8`,
+      [accountUid]
+    );
+    return result.rows.map((row) => row.device_id as string);
   }
 
   async authenticate(deviceId: string, token: string): Promise<Device | null> {
@@ -543,6 +880,36 @@ export class Repository {
         await client.query("ROLLBACK");
         return { status: "invalid" };
       }
+      if (state === "active") {
+        const participants = [call.caller_id as string, call.callee_id as string].sort();
+        for (const participant of participants) {
+          await client.query(
+            "SELECT pg_advisory_xact_lock(hashtext($1))",
+            [`active-call:${participant}`]
+          );
+        }
+        await client.query(
+          `DELETE FROM active_call_participants AS participant
+           WHERE participant.device_id = ANY($1::text[])
+             AND NOT EXISTS (
+               SELECT 1 FROM call_sessions AS active_call
+               WHERE active_call.call_id = participant.call_id
+                 AND active_call.state = 'active' AND active_call.expires_at > NOW()
+             )`,
+          [participants]
+        );
+        const reserved = await client.query(
+          `INSERT INTO active_call_participants(device_id, call_id)
+           VALUES ($1, $3), ($2, $3)
+           ON CONFLICT (device_id) DO NOTHING
+           RETURNING device_id`,
+          [participants[0], participants[1], callId]
+        );
+        if (reserved.rowCount !== 2) {
+          await client.query("ROLLBACK");
+          return { status: "participant_busy" };
+        }
+      }
       const stateTtlSeconds = state === "active" ? activeLeaseSeconds : TERMINAL_CALL_RETENTION_SECONDS;
       await client.query(
         `UPDATE call_sessions
@@ -550,6 +917,9 @@ export class Repository {
          WHERE call_id = $1`,
         [callId, state, stateTtlSeconds]
       );
+      if (state !== "active") {
+        await client.query("DELETE FROM active_call_participants WHERE call_id = $1", [callId]);
+      }
       const envelopeResult = await this.insertEnvelopeLocked(
         client,
         input,

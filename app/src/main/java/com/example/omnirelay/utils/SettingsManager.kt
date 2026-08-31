@@ -11,6 +11,8 @@ import org.json.JSONObject
 data class PairedContact(
     val name: String,
     val secretLink: String,
+    val accountUid: String? = null,
+    val deviceId: String? = null,
     val dateAddedMs: Long = System.currentTimeMillis()
 )
 
@@ -77,7 +79,8 @@ class SettingsManager(
         // Audio Toggles
         private const val KEY_NOISE_SUPPRESSION = "setting_noise_suppression"
         private const val KEY_ECHO_CANCELLATION = "setting_echo_cancellation"
-        private const val MAX_PAIRED_CONTACTS = 512
+        const val FREE_CONTACT_LIMIT = 20
+        private const val MAX_PAIRED_CONTACTS = FREE_CONTACT_LIMIT
     }
 
     /**
@@ -228,6 +231,8 @@ class SettingsManager(
                     PairedContact(
                         name = obj.optString("name", "Mutual Peer"),
                         secretLink = canonicalLink,
+                        accountUid = obj.optString("accountUid").takeIf { it.isNotBlank() },
+                        deviceId = obj.optString("deviceId").takeIf { it.isNotBlank() },
                         dateAddedMs = obj.optLong("dateAddedMs", System.currentTimeMillis())
                     )
                 )
@@ -257,6 +262,28 @@ class SettingsManager(
         return true
     }
 
+    fun syncAccountContacts(contacts: List<com.example.omnirelay.network.AccountContact>): Int {
+        val valid = contacts.mapNotNull { remote ->
+            val key = remote.publicKeyBase64?.let(::decodePublicKey) ?: return@mapNotNull null
+            val canonicalLink = Base64.encodeToString(key, Base64.NO_WRAP)
+            if (canonicalLink == getMySecretLink()) return@mapNotNull null
+            PairedContact(
+                name = remote.email.substringBefore('@').ifBlank { "Mutual Contact" },
+                secretLink = canonicalLink,
+                accountUid = remote.accountUid,
+                deviceId = remote.deviceId
+            )
+        }.distinctBy { it.accountUid ?: it.secretLink }.take(MAX_PAIRED_CONTACTS)
+        val manual = getPairedContacts().filter { it.accountUid == null }
+        val merged = (valid + manual).distinctBy { it.accountUid ?: it.secretLink }.take(MAX_PAIRED_CONTACTS)
+        saveContactsList(merged)
+        return valid.size
+    }
+
+    fun removeAccountContact(accountUid: String) {
+        saveContactsList(getPairedContacts().filterNot { it.accountUid == accountUid })
+    }
+
     fun removePairedContact(secretLink: String) {
         val keyToRemove = decodePublicKey(secretLink)
         val currentList = getPairedContacts().toMutableList()
@@ -273,6 +300,8 @@ class SettingsManager(
             val obj = JSONObject()
             obj.put("name", c.name)
             obj.put("secretLink", c.secretLink)
+            c.accountUid?.let { obj.put("accountUid", it) }
+            c.deviceId?.let { obj.put("deviceId", it) }
             obj.put("dateAddedMs", c.dateAddedMs)
             jsonArray.put(obj)
         }

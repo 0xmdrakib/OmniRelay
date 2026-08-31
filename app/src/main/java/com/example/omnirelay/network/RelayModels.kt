@@ -82,3 +82,45 @@ data class CallStateRequest(
 
 @Serializable
 data class CallTokenResponse(val url: String, val token: String)
+
+@Serializable
+data class ContactInvitationRequest(val email: String)
+
+@Serializable
+data class ContactInvitationResult(
+    val status: String,
+    val invitationId: String? = null,
+    val remainingToday: Int? = null
+)
+
+@Serializable
+data class ContactInvitation(
+    val invitationId: String,
+    val direction: String,
+    val counterpartAccountUid: String,
+    val counterpartEmail: String,
+    val createdAt: String,
+    val expiresAt: String
+)
+
+@Serializable
+data class ContactInvitationsResponse(val invitations: List<ContactInvitation>)
+
+@Serializable
+data class ContactInvitationResponseRequest(val action: String)
+
+@Serializable
+data class AccountContact(
+    val accountUid: String,
+    val email: String,
+    val deviceId: String? = null,
+    val publicKeyBase64: String? = null
+)
+
+@Serializable
+data class AccountContactsResponse(
+    val contacts: List<AccountContact>,
+    val plan: String,
+    val contactLimit: Int,
+    val dailyInvitationLimit: Int
+)

@@ -13,7 +13,7 @@ import {
 import test from "node:test";
 import pg from "pg";
 import WebSocket from "ws";
-import type { AccountTokenVerifier } from "../src/account-auth.js";
+import type { AccountTokenVerifier, VerifiedAccount } from "../src/account-auth.js";
 import { hashToken, registrationProof, registrationX25519Proof } from "../src/identity.js";
 import type { PushGateway } from "../src/push.js";
 import { Repository } from "../src/repository.js";
@@ -37,10 +37,10 @@ const accountByToken = new Map([
 
 const integrationAccountVerifier: AccountTokenVerifier = {
   configured: true,
-  async verifyIdToken(token: string): Promise<string> {
+  async verifyIdToken(token: string): Promise<VerifiedAccount> {
     const uid = accountByToken.get(token);
     if (!uid) throw new Error("invalid injected integration token");
-    return uid;
+    return { uid, email: `${uid}@example.test` };
   }
 };
 
@@ -325,6 +325,55 @@ test("two devices exchange, acknowledge and obtain LiveKit credentials", { skip:
   const sender = await registerDevice(accountAToken, true);
   const receiver = await registerDevice(accountBToken);
   const outsider = await registerDevice(accountCToken);
+
+  const inviteResponse = await fetch(`${baseUrl}/v1/contacts/invitations`, {
+    method: "POST",
+    headers: auth(sender),
+    body: JSON.stringify({ email: `${accountBUid}@example.test` })
+  });
+  assert.equal(inviteResponse.status, 201);
+  const invitation = await inviteResponse.json() as { invitationId: string; status: string };
+  assert.equal(invitation.status, "created");
+  const incomingInvites = await fetch(`${baseUrl}/v1/contacts/invitations`, {
+    headers: auth(receiver)
+  });
+  assert.equal(incomingInvites.status, 200);
+  const invitationList = await incomingInvites.json() as {
+    invitations: Array<{ invitationId: string; direction: string; counterpartEmail: string }>;
+  };
+  const incomingInvitation = invitationList.invitations.find(
+    (item) => item.invitationId === invitation.invitationId
+  );
+  assert.equal(incomingInvitation?.direction, "incoming");
+  assert.equal(incomingInvitation?.counterpartEmail, `${accountAUid}@example.test`);
+  const acceptedInvitation = await fetch(
+    `${baseUrl}/v1/contacts/invitations/${invitation.invitationId}/respond`,
+    {
+      method: "POST",
+      headers: auth(receiver),
+      body: JSON.stringify({ action: "accept" })
+    }
+  );
+  assert.equal(acceptedInvitation.status, 200);
+  assert.deepEqual(await acceptedInvitation.json(), { status: "accepted" });
+  const senderContactsResponse = await fetch(`${baseUrl}/v1/contacts`, { headers: auth(sender) });
+  assert.equal(senderContactsResponse.status, 200);
+  const senderContacts = await senderContactsResponse.json() as {
+    contacts: Array<{ accountUid: string; email: string; deviceId: string; publicKeyBase64: string }>;
+    contactLimit: number;
+    dailyInvitationLimit: number;
+  };
+  assert.equal(senderContacts.contactLimit, 20);
+  assert.equal(senderContacts.dailyInvitationLimit, 5);
+  assert.deepEqual(
+    senderContacts.contacts.find((contact) => contact.accountUid === accountBUid),
+    {
+      accountUid: accountBUid,
+      email: `${accountBUid}@example.test`,
+      deviceId: receiver.deviceId,
+      publicKeyBase64: receiver.publicKeyBase64
+    }
+  );
 
   const oldSenderSessionToken = sender.token;
   const rotationChallengeResponse = await requestChallenge(sender, accountAToken);
@@ -732,6 +781,47 @@ test("two devices exchange, acknowledge and obtain LiveKit credentials", { skip:
   assert.equal(media.url, process.env.EXPECTED_LIVEKIT_URL ?? media.url);
   assert.match(media.url, /^wss?:\/\//);
   assert.equal(media.token.split(".").length, 3);
+
+  const receiverToOutsiderRoute = backendRouteToken(receiver, outsider);
+  assert.equal(
+    (await replaceInboundRoutes(receiver, [
+      { sender, routeTokenBase64: senderToReceiverRoute },
+      { sender: outsider, routeTokenBase64: outsiderToReceiverRoute }
+    ])).status,
+    204
+  );
+  assert.equal(
+    (await replaceInboundRoutes(outsider, [
+      { sender: receiver, routeTokenBase64: receiverToOutsiderRoute }
+    ])).status,
+    204
+  );
+  const waitingCallId = randomUUID();
+  const waitingRing = await fetch(`${baseUrl}/v1/envelopes`, {
+    method: "POST",
+    headers: auth(outsider),
+    body: JSON.stringify({
+      envelopeId: randomUUID(),
+      recipientDeviceId: receiver.deviceId,
+      kind: "call",
+      callId: waitingCallId,
+      frameBase64: frame(outsider, receiver, 0x04),
+      routeTokenBase64: outsiderToReceiverRoute
+    })
+  });
+  assert.equal(waitingRing.status, 201);
+  const blockedWaitingAccept = await fetch(`${baseUrl}/v1/calls/${waitingCallId}/state`, {
+    method: "POST",
+    headers: auth(receiver),
+    body: JSON.stringify({
+      state: "active",
+      envelopeId: randomUUID(),
+      frameBase64: frame(receiver, outsider, 0x05),
+      routeTokenBase64: receiverToOutsiderRoute
+    })
+  });
+  assert.equal(blockedWaitingAccept.status, 409);
+  assert.deepEqual(await blockedWaitingAccept.json(), { error: "participant_busy" });
 
   assert.equal((await replaceInboundRoutes(receiver, [])).status, 204);
   const revokedRoute = await fetch(`${baseUrl}/v1/envelopes`, {

@@ -10,7 +10,9 @@ import {
   createAccountTokenVerifier,
   isValidAccountUid,
   MAX_FIREBASE_ID_TOKEN_LENGTH,
-  type AccountTokenVerifier
+  normalizeVerifiedEmail,
+  type AccountTokenVerifier,
+  type VerifiedAccount
 } from "./account-auth.js";
 import { config } from "./config.js";
 import { BoundedTaskQueue } from "./bounded-task-queue.js";
@@ -22,7 +24,7 @@ import {
   x25519RegistrationProofMatches
 } from "./identity.js";
 import { RealtimeHub } from "./hub.js";
-import { createPushGateway, InvalidPushTokenError, type PushGateway } from "./push.js";
+import { createPushGateway, InvalidPushTokenError, type PushGateway, type WakeKind } from "./push.js";
 import { Repository, UnauthorizedRouteError, type Device } from "./repository.js";
 import {
   decodeRouteTokenHashBase64,
@@ -103,6 +105,15 @@ const inboundRoutesSchema = z.object({
 });
 const callLeaseSchema = z.object({}).strict();
 const ackSchema = z.object({ state: z.enum(["delivered", "read", "rejected"]) }).strict();
+const contactInvitationSchema = z.object({
+  email: z.string().trim().min(3).max(320).email()
+}).strict();
+const contactInvitationResponseSchema = z.object({
+  action: z.enum(["accept", "decline"])
+}).strict();
+const accountUidSchema = z.string().min(1).max(128).refine(isValidAccountUid);
+const FREE_DAILY_INVITATION_LIMIT = 5;
+const FREE_CONTACT_LIMIT = 20;
 
 export type BuildServerOptions = {
   logger?: boolean;
@@ -131,15 +142,17 @@ function accountBearerToken(request: FastifyRequest): string | null {
   return token && token.length <= MAX_FIREBASE_ID_TOKEN_LENGTH ? token : null;
 }
 
-async function authenticatedAccountUid(
+async function authenticatedAccount(
   request: FastifyRequest,
   verifier: AccountTokenVerifier
-): Promise<string | null> {
+): Promise<VerifiedAccount | null> {
   const token = accountBearerToken(request);
   if (!token) return null;
   try {
-    const uid = await verifier.verifyIdToken(token);
-    return isValidAccountUid(uid) ? uid : null;
+    const account = await verifier.verifyIdToken(token);
+    return isValidAccountUid(account.uid) && normalizeVerifiedEmail(account.email)
+      ? account
+      : null;
   } catch {
     // Account tokens and verifier errors are intentionally never logged.
     return null;
@@ -218,7 +231,7 @@ export async function buildServer(repository = createRepository(), overrides: Bu
     reply.raw.once("finish", release);
     reply.raw.once("close", release);
   });
-  const wakeDevice = async (deviceId: string, envelopeId: string, kind: "message" | "call") => {
+  const wakeDevice = async (deviceId: string, envelopeId: string, kind: WakeKind) => {
     const fcmToken = await repository.fcmTokenFor(deviceId);
     if (!fcmToken) return;
     try {
@@ -228,7 +241,7 @@ export async function buildServer(repository = createRepository(), overrides: Bu
       app.log.warn({ error, deviceId }, "FCM wake failed");
     }
   };
-  const scheduleWake = (deviceId: string, envelopeId: string, kind: "message" | "call") => {
+  const scheduleWake = (deviceId: string, envelopeId: string, kind: WakeKind) => {
     if (!push.enabled) return;
     if (pushTasks.submit(() => wakeDevice(deviceId, envelopeId, kind))) return;
     droppedPushTasks += 1;
@@ -254,8 +267,12 @@ export async function buildServer(repository = createRepository(), overrides: Bu
   });
 
   app.post("/v1/devices/challenge", { config: { rateLimit: { max: 20, timeWindow: "1 minute" } } }, async (request, reply) => {
-    const accountUid = await authenticatedAccountUid(request, accountTokens);
-    if (!accountUid) return reply.code(401).send({ error: "invalid_account_token" });
+    const account = await authenticatedAccount(request, accountTokens);
+    if (!account) return reply.code(401).send({ error: "invalid_account_token" });
+    const accountUid = account.uid;
+    if (!await repository.upsertAccount(accountUid, account.email)) {
+      return reply.code(409).send({ error: "account_email_conflict" });
+    }
     const parsed = challengeSchema.safeParse(request.body);
     if (!parsed.success) return reply.code(400).send({ error: "invalid_request" });
     let deviceId: string;
@@ -303,8 +320,12 @@ export async function buildServer(repository = createRepository(), overrides: Bu
   });
 
   app.post("/v1/devices/register", { config: { rateLimit: { max: 20, timeWindow: "1 minute" } } }, async (request, reply) => {
-    const accountUid = await authenticatedAccountUid(request, accountTokens);
-    if (!accountUid) return reply.code(401).send({ error: "invalid_account_token" });
+    const account = await authenticatedAccount(request, accountTokens);
+    if (!account) return reply.code(401).send({ error: "invalid_account_token" });
+    const accountUid = account.uid;
+    if (!await repository.upsertAccount(accountUid, account.email)) {
+      return reply.code(409).send({ error: "account_email_conflict" });
+    }
     const parsed = registerSchema.safeParse(request.body);
     if (!parsed.success) return reply.code(400).send({ error: "invalid_request" });
     let deviceId: string;
@@ -369,6 +390,119 @@ export async function buildServer(repository = createRepository(), overrides: Bu
     await repository.revokeSession(device.deviceId);
     hub.disconnectDevice(device.deviceId);
     return reply.code(204).send();
+  });
+
+  app.post("/v1/contacts/invitations", {
+    config: { rateLimit: { max: 10, timeWindow: "1 minute" } }
+  }, async (request, reply) => {
+    const device = await authenticatedDevice(request, repository);
+    if (!device) return reply.code(401).send({ error: "unauthorized" });
+    const accountUid = await repository.accountUidForDevice(device.deviceId);
+    if (!accountUid) return reply.code(401).send({ error: "account_not_bound" });
+    const parsed = contactInvitationSchema.safeParse(request.body);
+    if (!parsed.success) return reply.code(400).send({ error: "invalid_request" });
+    const result = await repository.createContactInvitation(
+      randomUUID(),
+      accountUid,
+      device.deviceId,
+      parsed.data.email,
+      FREE_DAILY_INVITATION_LIMIT,
+      FREE_CONTACT_LIMIT
+    );
+    if (result.status === "created") {
+      for (const recipientDeviceId of result.recipientDeviceIds) {
+        hub.notify(recipientDeviceId, result.invitationId, "invite");
+        scheduleWake(recipientDeviceId, result.invitationId, "invite");
+      }
+      return reply.code(201).send({
+        status: "created",
+        invitationId: result.invitationId,
+        remainingToday: result.remainingToday
+      });
+    }
+    if (result.status === "already_pending") {
+      return reply.send({ status: "already_pending", invitationId: result.invitationId });
+    }
+    if (result.status === "daily_limit") {
+      return reply.code(429).send({ error: "daily_invitation_limit", limit: FREE_DAILY_INVITATION_LIMIT });
+    }
+    if (result.status === "contact_limit") {
+      return reply.code(409).send({ error: "contact_limit", limit: FREE_CONTACT_LIMIT });
+    }
+    if (result.status === "already_contact") {
+      return reply.code(409).send({ error: "already_contact" });
+    }
+    if (result.status === "self") return reply.code(400).send({ error: "cannot_invite_self" });
+    return reply.code(404).send({ error: "contact_unavailable" });
+  });
+
+  app.get("/v1/contacts/invitations", async (request, reply) => {
+    const device = await authenticatedDevice(request, repository);
+    if (!device) return reply.code(401).send({ error: "unauthorized" });
+    const accountUid = await repository.accountUidForDevice(device.deviceId);
+    if (!accountUid) return reply.code(401).send({ error: "account_not_bound" });
+    return reply.send({ invitations: await repository.contactInvitations(accountUid) });
+  });
+
+  app.post("/v1/contacts/invitations/:invitationId/respond", async (request, reply) => {
+    const device = await authenticatedDevice(request, repository);
+    if (!device) return reply.code(401).send({ error: "unauthorized" });
+    const accountUid = await repository.accountUidForDevice(device.deviceId);
+    if (!accountUid) return reply.code(401).send({ error: "account_not_bound" });
+    const invitationId = (request.params as { invitationId?: unknown }).invitationId;
+    if (typeof invitationId !== "string" || !z.uuid().safeParse(invitationId).success) {
+      return reply.code(400).send({ error: "invalid_request" });
+    }
+    const parsed = contactInvitationResponseSchema.safeParse(request.body);
+    if (!parsed.success) return reply.code(400).send({ error: "invalid_request" });
+    const result = await repository.respondContactInvitation(
+      invitationId,
+      accountUid,
+      device.deviceId,
+      parsed.data.action === "accept",
+      FREE_CONTACT_LIMIT
+    );
+    if (result.status === "not_found") return reply.code(404).send({ error: "invitation_not_found" });
+    if (result.status === "expired") return reply.code(410).send({ error: "invitation_expired" });
+    if (result.status === "contact_limit") {
+      return reply.code(409).send({ error: "contact_limit", limit: FREE_CONTACT_LIMIT });
+    }
+    if (!("otherDeviceIds" in result)) {
+      return reply.code(409).send({ error: "invitation_state_conflict" });
+    }
+    for (const otherDeviceId of result.otherDeviceIds) {
+      hub.notify(otherDeviceId, invitationId, "invite");
+      scheduleWake(otherDeviceId, invitationId, "invite");
+    }
+    hub.notify(device.deviceId, invitationId, "invite");
+    return reply.send({ status: result.status });
+  });
+
+  app.get("/v1/contacts", async (request, reply) => {
+    const device = await authenticatedDevice(request, repository);
+    if (!device) return reply.code(401).send({ error: "unauthorized" });
+    const accountUid = await repository.accountUidForDevice(device.deviceId);
+    if (!accountUid) return reply.code(401).send({ error: "account_not_bound" });
+    return reply.send({
+      contacts: await repository.accountContacts(accountUid),
+      plan: "free",
+      contactLimit: FREE_CONTACT_LIMIT,
+      dailyInvitationLimit: FREE_DAILY_INVITATION_LIMIT
+    });
+  });
+
+  app.delete("/v1/contacts/:accountUid", async (request, reply) => {
+    const device = await authenticatedDevice(request, repository);
+    if (!device) return reply.code(401).send({ error: "unauthorized" });
+    const accountUid = await repository.accountUidForDevice(device.deviceId);
+    if (!accountUid) return reply.code(401).send({ error: "account_not_bound" });
+    const otherAccountUid = (request.params as { accountUid?: unknown }).accountUid;
+    const parsed = accountUidSchema.safeParse(otherAccountUid);
+    if (!parsed.success || parsed.data === accountUid) {
+      return reply.code(400).send({ error: "invalid_request" });
+    }
+    const removed = await repository.removeAccountContact(accountUid, parsed.data);
+    return removed ? reply.code(204).send() : reply.code(404).send({ error: "contact_not_found" });
   });
 
   app.put("/v1/routes/inbound", {
@@ -603,6 +737,9 @@ export async function buildServer(repository = createRepository(), overrides: Bu
     }
     if (transition.status === "not_found") return reply.code(404).send({ error: "call_not_found" });
     if (transition.status === "invalid") return reply.code(409).send({ error: "invalid_call_transition" });
+    if (transition.status === "participant_busy") {
+      return reply.code(409).send({ error: "participant_busy" });
+    }
     if (transition.status === "envelope_conflict") {
       return reply.code(409).send({ error: "envelope_id_conflict" });
     }

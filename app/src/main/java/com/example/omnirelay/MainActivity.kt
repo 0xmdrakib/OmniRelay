@@ -52,6 +52,8 @@ import com.example.omnirelay.auth.GoogleAccountProfile
 import com.example.omnirelay.auth.GoogleSignInCancelledException
 import com.example.omnirelay.auth.NoAuthorizedGoogleAccountException
 import com.example.omnirelay.network.InternetRelayClient
+import com.example.omnirelay.network.ContactInvitation
+import com.example.omnirelay.network.RelayHttpException
 import com.example.omnirelay.network.SecureTokenStore
 import com.example.omnirelay.permissions.PermissionCapabilityPlanner
 import com.example.omnirelay.permissions.PermissionCapabilityPlanner.CapabilityPlan
@@ -80,6 +82,21 @@ private sealed interface AccountUiState {
 private const val ACCOUNT_MISMATCH_MESSAGE =
     "This device identity belongs to a different Google account. Sign in with the original account, " +
         "or explicitly reset app data only after confirming identity recovery."
+
+private fun contactRequestError(error: Throwable): String = when {
+    error !is RelayHttpException -> error.message ?: "Relay connection failed."
+    error.statusCode == 429 && error.message?.contains("daily_invitation_limit") == true ->
+        "Today's free-plan invitation limit has been reached."
+    error.statusCode == 409 && error.message?.contains("contact_limit") == true ->
+        "The free plan supports up to 20 mutual contacts."
+    error.statusCode == 409 && error.message?.contains("already_contact") == true ->
+        "This account is already a mutual contact."
+    error.statusCode == 404 && error.message?.contains("contact_unavailable") == true ->
+        "No registered OmniRelay account is available for that email."
+    error.statusCode == 400 && error.message?.contains("cannot_invite_self") == true ->
+        "You cannot invite your own account."
+    else -> "The contact request could not be completed."
+}
 
 class MainActivity : ComponentActivity() {
 
@@ -1392,9 +1409,30 @@ fun SettingsScreen(
     val context = androidx.compose.ui.platform.LocalContext.current
     val myLink = settingsManager.getMySecretLink()
     val pairedContacts = settingsManager.getPairedContacts()
+    val relayClient = remember(context) { InternetRelayClient(context.applicationContext) }
+    val scope = rememberCoroutineScope()
 
-    var nameInput by remember { mutableStateOf("") }
-    var linkInput by remember { mutableStateOf("") }
+    var inviteEmail by remember { mutableStateOf("") }
+    var invitationStatus by remember { mutableStateOf<String?>(null) }
+    var contactSyncBusy by remember { mutableStateOf(false) }
+    var pendingInvitations by remember { mutableStateOf<List<ContactInvitation>>(emptyList()) }
+    var dailyInvitationLimit by remember { mutableIntStateOf(5) }
+    var accountContactLimit by remember { mutableIntStateOf(SettingsManager.FREE_CONTACT_LIMIT) }
+
+    suspend fun refreshAccountContacts() {
+        if (relayClient.credentials() == null) return
+        val contacts = relayClient.fetchAccountContacts()
+        settingsManager.syncAccountContacts(contacts.contacts)
+        pendingInvitations = relayClient.fetchContactInvitations().invitations
+        dailyInvitationLimit = contacts.dailyInvitationLimit
+        accountContactLimit = contacts.contactLimit
+        onSettingsUpdated()
+    }
+
+    LaunchedEffect(accountProfile.uid) {
+        runCatching { refreshAccountContacts() }
+            .onFailure { invitationStatus = "Connect to the relay to sync contacts." }
+    }
 
     var bleChecked by remember { mutableStateOf(settingsManager.isBleEnabled) }
     var wifiChecked by remember { mutableStateOf(settingsManager.isWifiAwareEnabled) }
@@ -1554,10 +1592,10 @@ fun SettingsScreen(
             }
         }
 
-        // Section: Pair New Contact
+        // Section: Account-backed mutual invitations
         item {
             Text(
-                text = "PAIR NEW MUTUAL CONTACT",
+                text = "INVITE MUTUAL CONTACT",
                 fontWeight = FontWeight.Bold,
                 color = Color(0xFF7E7E9A),
                 fontSize = 12.sp,
@@ -1573,24 +1611,18 @@ fun SettingsScreen(
                 elevation = CardDefaults.cardElevation(defaultElevation = 2.dp)
             ) {
                 Column(modifier = Modifier.padding(20.dp)) {
-                    Text("Add Contact's Secret Link", color = Color(0xFF1E1C2E), fontWeight = FontWeight.Bold, fontSize = 15.sp)
-                    Spacer(modifier = Modifier.height(10.dp))
-
-                    OutlinedTextField(
-                        value = nameInput,
-                        onValueChange = { nameInput = it },
-                        placeholder = { Text("Contact Name (e.g. Receiver Phone)", color = Color(0xFFB2BEC3), fontSize = 13.sp) },
-                        modifier = Modifier.fillMaxWidth(),
-                        singleLine = true,
-                        shape = RoundedCornerShape(12.dp)
+                    Text("Invite by verified Google email", color = Color(0xFF1E1C2E), fontWeight = FontWeight.Bold, fontSize = 15.sp)
+                    Text(
+                        "Free plan: up to $dailyInvitationLimit invitations per UTC day and $accountContactLimit contacts.",
+                        color = Color(0xFF7E7E9A),
+                        fontSize = 11.sp
                     )
-
                     Spacer(modifier = Modifier.height(10.dp))
 
                     OutlinedTextField(
-                        value = linkInput,
-                        onValueChange = { linkInput = it },
-                        placeholder = { Text("Paste Secret Link...", color = Color(0xFFB2BEC3), fontSize = 13.sp) },
+                        value = inviteEmail,
+                        onValueChange = { inviteEmail = it.take(320) },
+                        placeholder = { Text("contact@gmail.com", color = Color(0xFFB2BEC3), fontSize = 13.sp) },
                         modifier = Modifier.fillMaxWidth(),
                         singleLine = true,
                         shape = RoundedCornerShape(12.dp)
@@ -1600,19 +1632,95 @@ fun SettingsScreen(
 
                     Button(
                         onClick = {
-                            if (settingsManager.addPairedContact(nameInput, linkInput)) {
-                                nameInput = ""
-                                linkInput = ""
-                                onSettingsUpdated()
+                            val email = inviteEmail.trim()
+                            if (email.isBlank() || contactSyncBusy) return@Button
+                            contactSyncBusy = true
+                            invitationStatus = null
+                            scope.launch {
+                                runCatching {
+                                    val result = relayClient.sendContactInvitation(email)
+                                    inviteEmail = ""
+                                    pendingInvitations = relayClient.fetchContactInvitations().invitations
+                                    when (result.status) {
+                                        "created" -> "Invitation sent securely."
+                                        "already_pending" -> "An invitation is already pending."
+                                        else -> "Invitation request updated."
+                                    }
+                                }.onSuccess { invitationStatus = it }
+                                    .onFailure { invitationStatus = contactRequestError(it) }
+                                contactSyncBusy = false
                             }
                         },
                         modifier = Modifier.fillMaxWidth().height(48.dp),
+                        enabled = !contactSyncBusy && inviteEmail.isNotBlank(),
                         colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF6C5CE7)),
                         shape = RoundedCornerShape(12.dp)
                     ) {
                         Icon(Icons.Default.PersonAdd, contentDescription = null, tint = Color.White, modifier = Modifier.size(18.dp))
                         Spacer(modifier = Modifier.width(8.dp))
-                        Text("PAIR & ADD CONTACT", color = Color.White, fontWeight = FontWeight.Bold)
+                        Text(if (contactSyncBusy) "SENDING..." else "SEND INVITATION", color = Color.White, fontWeight = FontWeight.Bold)
+                    }
+                    invitationStatus?.let {
+                        Spacer(Modifier.height(10.dp))
+                        Text(it, color = Color(0xFF7E7E9A), fontSize = 11.sp)
+                    }
+                }
+            }
+        }
+
+        if (pendingInvitations.any { it.direction == "incoming" }) {
+            item {
+                Text(
+                    text = "INCOMING INVITATIONS",
+                    fontWeight = FontWeight.Bold,
+                    color = Color(0xFF7E7E9A),
+                    fontSize = 12.sp,
+                    letterSpacing = 1.sp
+                )
+            }
+            items(
+                pendingInvitations.filter { it.direction == "incoming" },
+                key = { it.invitationId }
+            ) { invitation ->
+                Surface(
+                    modifier = Modifier.fillMaxWidth(),
+                    shape = RoundedCornerShape(16.dp),
+                    color = Color.White,
+                    shadowElevation = 1.dp
+                ) {
+                    Column(modifier = Modifier.padding(16.dp)) {
+                        Text(invitation.counterpartEmail, fontWeight = FontWeight.Bold, color = Color(0xFF1E1C2E))
+                        Text("Verified Google account", color = Color(0xFF00A884), fontSize = 10.sp)
+                        Spacer(Modifier.height(10.dp))
+                        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                            Button(
+                                onClick = {
+                                    scope.launch {
+                                        contactSyncBusy = true
+                                        runCatching {
+                                            relayClient.respondContactInvitation(invitation.invitationId, true)
+                                            refreshAccountContacts()
+                                        }.onFailure { invitationStatus = contactRequestError(it) }
+                                        contactSyncBusy = false
+                                    }
+                                },
+                                enabled = !contactSyncBusy,
+                                colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF00A884))
+                            ) { Text("ACCEPT", color = Color.White, fontWeight = FontWeight.Bold) }
+                            OutlinedButton(
+                                onClick = {
+                                    scope.launch {
+                                        contactSyncBusy = true
+                                        runCatching {
+                                            relayClient.respondContactInvitation(invitation.invitationId, false)
+                                            pendingInvitations = relayClient.fetchContactInvitations().invitations
+                                        }.onFailure { invitationStatus = contactRequestError(it) }
+                                        contactSyncBusy = false
+                                    }
+                                },
+                                enabled = !contactSyncBusy
+                            ) { Text("DECLINE", fontWeight = FontWeight.Bold) }
+                        }
                     }
                 }
             }
@@ -1657,8 +1765,23 @@ fun SettingsScreen(
 
                         IconButton(
                             onClick = {
-                                settingsManager.removePairedContact(contact.secretLink)
-                                onSettingsUpdated()
+                                val accountUid = contact.accountUid
+                                if (accountUid == null) {
+                                    settingsManager.removePairedContact(contact.secretLink)
+                                    onSettingsUpdated()
+                                } else {
+                                    scope.launch {
+                                        contactSyncBusy = true
+                                        runCatching {
+                                            relayClient.removeAccountContact(accountUid)
+                                            settingsManager.removeAccountContact(accountUid)
+                                            refreshAccountContacts()
+                                        }.onFailure {
+                                            invitationStatus = contactRequestError(it)
+                                        }
+                                        contactSyncBusy = false
+                                    }
+                                }
                             },
                             modifier = Modifier.size(36.dp).background(Color(0xFFFF7675).copy(alpha = 0.15f), CircleShape)
                         ) {

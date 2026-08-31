@@ -95,6 +95,16 @@ private data class NearbyVoicePayload(
     val audio: ByteArray
 )
 
+private data class WaitingCall(
+    val callerName: String,
+    val callerPublicKeyBase64: String,
+    val callId: String,
+    val peerPublicKey: ByteArray,
+    val expiresAtMs: Long
+)
+
+private enum class InternetCallTransitionResult { SENT, UNAVAILABLE, PARTICIPANT_BUSY }
+
 /** Owns nearby transports, secure framing, call state and notifications. */
 class OmniRelayService : Service() {
 
@@ -107,11 +117,13 @@ class OmniRelayService : Service() {
         const val CALL_NOTIFICATION_ID = 0x101
         const val MSG_NOTIFICATION_ID = 0x102
         const val IDENTITY_NOTIFICATION_ID = 0x103
+        const val CALL_WAITING_NOTIFICATION_ID = 0x104
 
         const val ACTION_ACCEPT_CALL = "com.example.omnirelay.ACTION_ACCEPT_CALL"
         const val ACTION_DECLINE_CALL = "com.example.omnirelay.ACTION_DECLINE_CALL"
         const val ACTION_END_CALL = "com.example.omnirelay.ACTION_END_CALL"
         const val ACTION_SYNC_MAILBOX = "com.example.omnirelay.ACTION_SYNC_MAILBOX"
+        const val ACTION_SYNC_CONTACTS = "com.example.omnirelay.ACTION_SYNC_CONTACTS"
         const val ACTION_UPDATE_PUSH_TOKEN = "com.example.omnirelay.ACTION_UPDATE_PUSH_TOKEN"
         const val EXTRA_PUSH_TOKEN = "push_token"
 
@@ -153,6 +165,7 @@ class OmniRelayService : Service() {
 
     private var ringtonePlayer: Ringtone? = null
     private val callState = CallStateMachine()
+    private val waitingCallLock = Any()
     private val voiceCounterLock = Any()
     private val activeCallId: String? get() = callState.snapshot()?.callId
     private val activePeerPublicKey: ByteArray? get() = callState.snapshot()?.peerPublicKey
@@ -175,6 +188,7 @@ class OmniRelayService : Service() {
     private var bleAdvertiseDutyJob: Job? = null
     private var incomingRingTimeoutJob: Job? = null
     private var callLeaseJob: Job? = null
+    @Volatile private var waitingCall: WaitingCall? = null
     private val outgoingVoiceCounter = AtomicLong(0)
     @Volatile private var lastIncomingVoiceCounter = -1L
     @Volatile private var appInForeground = false
@@ -316,6 +330,12 @@ class OmniRelayService : Service() {
             ACTION_DECLINE_CALL -> declineIncomingCall()
             ACTION_END_CALL -> stopVoiceCall()
             ACTION_SYNC_MAILBOX -> initializeInternetRelay()
+            ACTION_SYNC_CONTACTS -> serviceScope.launch {
+                runCatching {
+                    ensureInternetRegistration(null)
+                    syncAccountContacts(notifyIncoming = true)
+                }.onFailure { Log.w(TAG, "Contact invitation sync deferred", it) }
+            }
             ACTION_UPDATE_PUSH_TOKEN -> intent.getStringExtra(EXTRA_PUSH_TOKEN)?.let { token ->
                 serviceScope.launch { updatePushToken(token) }
             }
@@ -367,6 +387,7 @@ class OmniRelayService : Service() {
                 telecomCallManager.disconnect(android.telecom.DisconnectCause.CANCELED)
                 applyResourcePolicy()
                 appendChatMessage("Outgoing call timed out")
+                promoteWaitingCall()
             }
         }
     }
@@ -383,12 +404,18 @@ class OmniRelayService : Service() {
         serviceScope.launch {
             val callId = call.callId
             val frame = buildSecureFrame(OmniFrame.PAYLOAD_TYPE_CALL_ACCEPT, target, encodeCallId(callId))
-            val internetSent = transitionInternetCall(callId, "active", frame, target)
-            if (internetSent) {
+            val internetTransition = transitionInternetCall(callId, "active", frame, target)
+            if (internetTransition == InternetCallTransitionResult.SENT) {
                 if (callState.matches(callId, target, CallStateMachine.Phase.CONNECTING)) {
                     connectInternetMedia(callId, target)
                     appendChatMessage("Call connected with [${invite?.callerId ?: "Peer"}]")
                 }
+            } else if (internetTransition == InternetCallTransitionResult.PARTICIPANT_BUSY) {
+                callState.terminateRemote(callId, target, CallStateMachine.Phase.CONNECTING)
+                telecomCallManager.disconnect(android.telecom.DisconnectCause.BUSY)
+                applyResourcePolicy()
+                appendChatMessage("Unable to answer: one participant is already in another call")
+                promoteWaitingCall()
             } else if (callState.matches(callId, target, CallStateMachine.Phase.CONNECTING) &&
                 sendNearbyFrame(target, frame)
             ) {
@@ -427,13 +454,14 @@ class OmniRelayService : Service() {
                 frame,
                 call.peerPublicKey
             )
-            if (!transitioned) {
+            if (transitioned != InternetCallTransitionResult.SENT) {
                 sendNearbyFrame(call.peerPublicKey, frame)
             }
         }
         applyResourcePolicy()
         telecomCallManager.disconnect(android.telecom.DisconnectCause.REJECTED)
         appendChatMessage("Call rejected [${invite?.callerId ?: "Peer"}]")
+        promoteWaitingCall()
     }
 
     fun stopVoiceCall(fromTelecom: Boolean = false) {
@@ -454,7 +482,9 @@ class OmniRelayService : Service() {
                     frame,
                     ended.peerPublicKey
                 )
-                if (!transitioned) sendNearbyFrame(ended.peerPublicKey, frame)
+                if (transitioned != InternetCallTransitionResult.SENT) {
+                    sendNearbyFrame(ended.peerPublicKey, frame)
+                }
             }
         }
         stopRingtone()
@@ -466,6 +496,7 @@ class OmniRelayService : Service() {
         startForegroundServiceNotification(includeMicrophone = false)
         applyResourcePolicy()
         appendChatMessage("Voice call ended")
+        promoteWaitingCall()
     }
 
     fun dispatchMessage(text: String, targetAddress: String): String {
@@ -782,9 +813,15 @@ class OmniRelayService : Service() {
             ensureInternetRegistration(null)
             router.updatePathTelemetry(TransportPath.CELLULAR_CONTROL, true, 100, 0f, -70)
             relayClient.connectRealtime(
-                onMailboxChanged = { serviceScope.launch { syncMailbox() } },
+                onMailboxChanged = {
+                    serviceScope.launch {
+                        syncMailbox()
+                        syncAccountContacts(notifyIncoming = true)
+                    }
+                },
                 onFailure = { scheduleRelayRetry() }
             )
+            syncAccountContacts(notifyIncoming = false)
             syncMailbox()
             processOutbox()
         }.onFailure {
@@ -792,6 +829,22 @@ class OmniRelayService : Service() {
             Log.w(TAG, "Internet relay initialization deferred", it)
             if (it !is AccountAuthenticationRequiredException) scheduleRelayRetry()
         }
+    }
+
+    private suspend fun syncAccountContacts(notifyIncoming: Boolean) {
+        val contacts = relayClient.fetchAccountContacts()
+        val before = settingsManager.getPairedContacts().map { it.secretLink }.toSet()
+        settingsManager.syncAccountContacts(contacts.contacts)
+        val after = settingsManager.getPairedContacts().map { it.secretLink }.toSet()
+        if (before != after) {
+            pairSharedKeyCache.values.forEach { it.fill(0) }
+            pairSharedKeyCache.clear()
+            ensureInternetRegistration(null)
+        }
+        if (!notifyIncoming) return
+        relayClient.fetchContactInvitations().invitations
+            .filter { it.direction == "incoming" }
+            .forEach { postContactInvitationNotification(it.counterpartEmail, it.invitationId) }
     }
 
     private suspend fun updatePushToken(token: String) {
@@ -973,8 +1026,10 @@ class OmniRelayService : Service() {
         state: String,
         packedFrame: ByteArray,
         targetPublicKey: ByteArray
-    ): Boolean {
-        if (!relayClient.isConfigured || !settingsManager.isRelayModeEnabled) return false
+    ): InternetCallTransitionResult {
+        if (!relayClient.isConfigured || !settingsManager.isRelayModeEnabled) {
+            return InternetCallTransitionResult.UNAVAILABLE
+        }
         return runCatching {
             relayClient.transitionCall(callId, CallStateRequest(
                 state = state,
@@ -982,10 +1037,13 @@ class OmniRelayService : Service() {
                 frameBase64 = Base64.encodeToString(packedFrame, Base64.NO_WRAP),
                 routeTokenBase64 = routeTokenBase64(targetPublicKey)
             ))
-            true
+            InternetCallTransitionResult.SENT
         }.getOrElse {
             Log.w(TAG, "Internet call transition failed", it)
-            false
+            if (it is RelayHttpException && it.statusCode == 409 &&
+                it.message?.contains("participant_busy") == true
+            ) InternetCallTransitionResult.PARTICIPANT_BUSY
+            else InternetCallTransitionResult.UNAVAILABLE
         }
     }
 
@@ -1126,6 +1184,21 @@ class OmniRelayService : Service() {
                 val secureCallId = authenticatedCallId ?: return false
                 when (callState.receiveIncomingRing(secureCallId, frame.ephemeralPublicKey)) {
                     CallStateMachine.RingResult.REJECTED -> return false
+                    CallStateMachine.RingResult.BUSY -> {
+                        val remaining = callSignalRemainingMs ?: return false
+                        synchronized(waitingCallLock) {
+                            waitingCall?.peerPublicKey?.fill(0)
+                            waitingCall = WaitingCall(
+                                callerName = contactName,
+                                callerPublicKeyBase64 = senderLink,
+                                callId = secureCallId,
+                                peerPublicKey = frame.ephemeralPublicKey.copyOf(),
+                                expiresAtMs = System.currentTimeMillis() + remaining
+                            )
+                        }
+                        postCallWaitingNotification(contactName)
+                        appendChatMessage("Call waiting from [$contactName]")
+                    }
                     CallStateMachine.RingResult.DUPLICATE -> Unit
                     CallStateMachine.RingResult.NEW -> {
                         outgoingVoiceCounter.set(0)
@@ -1263,6 +1336,37 @@ class OmniRelayService : Service() {
         }
     }
 
+    private fun promoteWaitingCall() {
+        if (callState.snapshot() != null) return
+        val waiting = synchronized(waitingCallLock) {
+            val candidate = waitingCall ?: return@synchronized null
+            if (candidate.expiresAtMs <= System.currentTimeMillis()) {
+                candidate.peerPublicKey.fill(0)
+                waitingCall = null
+                return@synchronized null
+            }
+            waitingCall = null
+            candidate
+        } ?: run {
+            cancelNotification(CALL_WAITING_NOTIFICATION_ID)
+            return
+        }
+        val remaining = waiting.expiresAtMs - System.currentTimeMillis()
+        if (callState.receiveIncomingRing(waiting.callId, waiting.peerPublicKey) ==
+            CallStateMachine.RingResult.NEW
+        ) {
+            cancelNotification(CALL_WAITING_NOTIFICATION_ID)
+            handleIncomingCallRing(
+                waiting.callerName,
+                waiting.callerPublicKeyBase64,
+                waiting.callId,
+                remaining
+            )
+        } else {
+            synchronized(waitingCallLock) { waitingCall = waiting }
+        }
+    }
+
     private fun handleCallAccepted(
         contactName: String,
         call: CallStateMachine.Session,
@@ -1288,6 +1392,7 @@ class OmniRelayService : Service() {
         telecomCallManager.disconnect(android.telecom.DisconnectCause.REJECTED)
         applyResourcePolicy()
         appendChatMessage("Call declined by [$contactName]")
+        promoteWaitingCall()
     }
 
     private fun handleRemoteCallEnded(contactName: String, call: CallStateMachine.Session) {
@@ -1303,6 +1408,7 @@ class OmniRelayService : Service() {
         startForegroundServiceNotification(includeMicrophone = false)
         applyResourcePolicy()
         appendChatMessage("Call ended by [$contactName]")
+        promoteWaitingCall()
     }
 
     private suspend fun handleIncomingTextMsg(
@@ -1345,6 +1451,11 @@ class OmniRelayService : Service() {
         callLeaseJob = null
         stopRingtone()
         incomingRingTimeoutJob?.cancel()
+        synchronized(waitingCallLock) {
+            waitingCall?.peerPublicKey?.fill(0)
+            waitingCall = null
+        }
+        cancelNotification(CALL_WAITING_NOTIFICATION_ID)
         if (::bleMeshManager.isInitialized) bleMeshManager.close()
         if (::wifiAwareMeshManager.isInitialized) wifiAwareMeshManager.close()
         if (::relayClient.isInitialized) relayClient.closeRealtime()
@@ -1451,6 +1562,27 @@ class OmniRelayService : Service() {
             .notify(CALL_NOTIFICATION_ID, notification)
     }
 
+    private fun postCallWaitingNotification(callerId: String) {
+        val contentIntent = PendingIntent.getActivity(
+            this,
+            5,
+            Intent(this, MainActivity::class.java),
+            PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
+        )
+        val notification = NotificationCompat.Builder(this, CALL_CHANNEL_ID)
+            .setSmallIcon(R.drawable.ic_notification)
+            .setContentTitle("Another encrypted call is waiting")
+            .setContentText(callerId)
+            .setPriority(NotificationCompat.PRIORITY_HIGH)
+            .setVisibility(NotificationCompat.VISIBILITY_PRIVATE)
+            .setCategory(NotificationCompat.CATEGORY_CALL)
+            .setContentIntent(contentIntent)
+            .setAutoCancel(true)
+            .build()
+        (getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager)
+            .notify(CALL_WAITING_NOTIFICATION_ID, notification)
+    }
+
     private fun postIncomingMessageNotification(senderId: String, text: String) {
         val contentIntent = PendingIntent.getActivity(
             this, 4, Intent(this, MainActivity::class.java), PendingIntent.FLAG_IMMUTABLE
@@ -1466,6 +1598,26 @@ class OmniRelayService : Service() {
             .build()
         (getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager)
             .notify(MSG_NOTIFICATION_ID, notification)
+    }
+
+    private fun postContactInvitationNotification(email: String, invitationId: String) {
+        val contentIntent = PendingIntent.getActivity(
+            this,
+            invitationId.hashCode(),
+            Intent(this, MainActivity::class.java),
+            PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
+        )
+        val notification = NotificationCompat.Builder(this, MSG_CHANNEL_ID)
+            .setSmallIcon(R.drawable.ic_notification)
+            .setContentTitle("New mutual contact invitation")
+            .setContentText(email)
+            .setPriority(NotificationCompat.PRIORITY_HIGH)
+            .setVisibility(NotificationCompat.VISIBILITY_PRIVATE)
+            .setContentIntent(contentIntent)
+            .setAutoCancel(true)
+            .build()
+        (getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager)
+            .notify(invitationId.hashCode(), notification)
     }
 
     private fun playRingtone() {

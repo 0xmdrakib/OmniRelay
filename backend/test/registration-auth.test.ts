@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import type { AccountTokenVerifier } from "../src/account-auth.js";
+import type { AccountTokenVerifier, VerifiedAccount } from "../src/account-auth.js";
 import type { PushGateway } from "../src/push.js";
 import type { CleanupResult, Repository } from "../src/repository.js";
 import { buildServer } from "../src/server.js";
@@ -25,6 +25,7 @@ class NoDatabaseRepository {
     return { envelopes: 0, calls: 0, challenges: 0 };
   }
   async close(): Promise<void> {}
+  async upsertAccount(): Promise<boolean> { this.databaseCalls += 1; return true; }
 }
 
 class UnitAccountVerifier implements AccountTokenVerifier {
@@ -33,10 +34,10 @@ class UnitAccountVerifier implements AccountTokenVerifier {
 
   constructor(private readonly uid: string = "unit-account-uid") {}
 
-  async verifyIdToken(token: string): Promise<string> {
+  async verifyIdToken(token: string): Promise<VerifiedAccount> {
     this.receivedTokens.push(token);
     if (token !== validAccountToken) throw new Error("invalid test token");
-    return this.uid;
+    return { uid: this.uid, email: "unit-account@example.com" };
   }
 }
 
@@ -112,7 +113,7 @@ test("readiness fails closed without Firebase Admin and succeeds with an account
     pushGateway: disabledPush,
     accountTokenVerifier: {
       configured: false,
-      async verifyIdToken(): Promise<string> { throw new Error("disabled"); }
+      async verifyIdToken(): Promise<VerifiedAccount> { throw new Error("disabled"); }
     }
   });
   const notReady = await unavailable.inject({ method: "GET", url: "/readyz" });

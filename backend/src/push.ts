@@ -2,9 +2,11 @@ import type { App } from "firebase-admin/app";
 import { getMessaging } from "firebase-admin/messaging";
 import { getOrCreateFirebaseAdminApp } from "./firebase-admin.js";
 
+export type WakeKind = "message" | "call" | "invite";
+
 export interface PushGateway {
   readonly enabled: boolean;
-  sendWake(token: string, envelopeId: string, kind: "message" | "call"): Promise<void>;
+  sendWake(token: string, envelopeId: string, kind: WakeKind): Promise<void>;
 }
 
 export class InvalidPushTokenError extends Error {
@@ -28,7 +30,7 @@ class FirebasePushGateway implements PushGateway {
 
   constructor(private readonly app: App) {}
 
-  async sendWake(token: string, envelopeId: string, kind: "message" | "call"): Promise<void> {
+  async sendWake(token: string, envelopeId: string, kind: WakeKind): Promise<void> {
     try {
       await getMessaging(this.app).send({
         token,

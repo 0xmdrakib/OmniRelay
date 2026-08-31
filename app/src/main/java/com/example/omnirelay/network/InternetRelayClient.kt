@@ -9,6 +9,7 @@ import kotlinx.coroutines.sync.withLock
 import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
 import okhttp3.MediaType.Companion.toMediaType
+import okhttp3.HttpUrl.Companion.toHttpUrl
 import okhttp3.OkHttpClient
 import okhttp3.ConnectionPool
 import okhttp3.Call
@@ -214,6 +215,51 @@ class InternetRelayClient(context: Context) {
         credentialsStore.clear()
         syncedRouteFingerprint = null
         lastRouteSyncAtMillis = 0L
+    }
+
+    suspend fun sendContactInvitation(email: String): ContactInvitationResult {
+        val body = json.encodeToString(ContactInvitationRequest(email.trim()))
+        return execute(
+            authenticatedRequest("$baseUrl/v1/contacts/invitations")
+                .post(body.toRequestBody(mediaType))
+                .build()
+        ).use { response ->
+            requireSuccess(response)
+            json.decodeFromString(response.body.string())
+        }
+    }
+
+    suspend fun fetchContactInvitations(): ContactInvitationsResponse = execute(
+        authenticatedRequest("$baseUrl/v1/contacts/invitations").get().build()
+    ).use { response ->
+        requireSuccess(response)
+        json.decodeFromString(response.body.string())
+    }
+
+    suspend fun respondContactInvitation(invitationId: String, accept: Boolean) {
+        val body = json.encodeToString(
+            ContactInvitationResponseRequest(if (accept) "accept" else "decline")
+        )
+        execute(
+            authenticatedRequest("$baseUrl/v1/contacts/invitations/$invitationId/respond")
+                .post(body.toRequestBody(mediaType))
+                .build()
+        ).use { requireSuccess(it) }
+    }
+
+    suspend fun fetchAccountContacts(): AccountContactsResponse = execute(
+        authenticatedRequest("$baseUrl/v1/contacts").get().build()
+    ).use { response ->
+        requireSuccess(response)
+        json.decodeFromString(response.body.string())
+    }
+
+    suspend fun removeAccountContact(accountUid: String) {
+        val url = baseUrl.toHttpUrl().newBuilder()
+            .addPathSegments("v1/contacts")
+            .addPathSegment(accountUid)
+            .build()
+        execute(authenticatedRequest(url.toString()).delete().build()).use { requireSuccess(it) }
     }
 
     suspend fun sendEnvelope(envelope: SendEnvelopeRequest) {

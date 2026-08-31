@@ -26,7 +26,12 @@ class OmniFirebaseMessagingService : FirebaseMessagingService() {
 
     override fun onMessageReceived(message: RemoteMessage) {
         if (message.data["type"] != "mailbox_changed") return
-        wakeService(OmniRelayService.ACTION_SYNC_MAILBOX, null)
+        val action = if (message.data["kind"] == "invite") {
+            OmniRelayService.ACTION_SYNC_CONTACTS
+        } else {
+            OmniRelayService.ACTION_SYNC_MAILBOX
+        }
+        wakeService(action, null)
     }
 
     private fun wakeService(action: String, token: String?) {

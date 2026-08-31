@@ -80,4 +80,16 @@ class CallStateMachineTest {
         assertNotNull(machine.activate("incoming", peerA))
         assertTrue(machine.matches("incoming", peerA, CallStateMachine.Phase.ACTIVE))
     }
+
+    @Test
+    fun secondIncomingCallIsReportedAsBusyWithoutReplacingTheActiveCall() {
+        val machine = CallStateMachine()
+        assertEquals(CallStateMachine.RingResult.NEW, machine.receiveIncomingRing("first", peerA))
+        assertNotNull(machine.beginLocalAccept())
+        assertNotNull(machine.activate("first", peerA))
+
+        assertEquals(CallStateMachine.RingResult.BUSY, machine.receiveIncomingRing("second", peerB))
+        assertTrue(machine.matches("first", peerA, CallStateMachine.Phase.ACTIVE))
+        assertFalse(machine.matches("second", peerB))
+    }
 }

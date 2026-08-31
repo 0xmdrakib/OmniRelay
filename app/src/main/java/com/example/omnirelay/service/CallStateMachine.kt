@@ -3,7 +3,7 @@ package com.example.omnirelay.service
 /** Small, synchronized call FSM. Network/UI side effects occur only after a winning transition. */
 internal class CallStateMachine {
     enum class Phase { OUTGOING_RINGING, INCOMING_RINGING, CONNECTING, ACTIVE }
-    enum class RingResult { NEW, DUPLICATE, REJECTED }
+    enum class RingResult { NEW, DUPLICATE, BUSY, REJECTED }
 
     data class Session(
         val callId: String,
@@ -35,7 +35,7 @@ internal class CallStateMachine {
         }
         if (state.callId == callId && state.peerPublicKey.contentEquals(peerPublicKey) &&
             state.phase == Phase.INCOMING_RINGING
-        ) RingResult.DUPLICATE else RingResult.REJECTED
+        ) RingResult.DUPLICATE else RingResult.BUSY
     }
 
     fun beginLocalAccept(): Session? = transitionCurrent(Phase.INCOMING_RINGING, Phase.CONNECTING)

@@ -57,7 +57,7 @@ export class RealtimeHub {
     return this.totalSockets;
   }
 
-  notify(deviceId: string, envelopeId: string, kind: "message" | "call"): void {
+  notify(deviceId: string, envelopeId: string, kind: "message" | "call" | "invite"): void {
     this.send(deviceId, { type: "mailbox.changed", envelopeId, kind });
   }
 
