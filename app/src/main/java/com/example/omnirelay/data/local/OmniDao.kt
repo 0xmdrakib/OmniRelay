@@ -96,4 +96,28 @@ interface OmniDao {
 
     @Query("DELETE FROM processed_envelopes WHERE processedAtMs < :beforeMs")
     suspend fun pruneProcessed(beforeMs: Long)
+
+    @Insert(onConflict = OnConflictStrategy.IGNORE)
+    suspend fun insertRelayCapsule(capsule: RelayCapsuleEntity): Long
+
+    @Query(
+        "SELECT * FROM relay_capsule_queue WHERE expiresAtMs > :nowMs " +
+            "AND nextAttemptAtMs <= :nowMs ORDER BY createdAtMs ASC LIMIT :limit"
+    )
+    suspend fun pendingRelayCapsules(nowMs: Long, limit: Int): List<RelayCapsuleEntity>
+
+    @Query("SELECT COUNT(*) AS itemCount, COALESCE(SUM(LENGTH(packet)), 0) AS totalBytes FROM relay_capsule_queue")
+    suspend fun relayQueueStats(): RelayQueueStats
+
+    @Query(
+        "UPDATE relay_capsule_queue SET attemptCount = attemptCount + 1, " +
+            "nextAttemptAtMs = :nextAttemptAtMs WHERE capsuleId = :capsuleId"
+    )
+    suspend fun deferRelayCapsule(capsuleId: String, nextAttemptAtMs: Long)
+
+    @Query("DELETE FROM relay_capsule_queue WHERE capsuleId = :capsuleId")
+    suspend fun deleteRelayCapsule(capsuleId: String)
+
+    @Query("DELETE FROM relay_capsule_queue WHERE expiresAtMs <= :nowMs OR attemptCount >= :maxAttempts")
+    suspend fun pruneRelayCapsules(nowMs: Long, maxAttempts: Int)
 }

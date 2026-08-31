@@ -62,6 +62,12 @@ CREATE TABLE IF NOT EXISTS active_call_participants (
   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
+CREATE TABLE IF NOT EXISTS active_call_accounts (
+  account_uid TEXT PRIMARY KEY REFERENCES accounts(account_uid) ON DELETE CASCADE,
+  call_id UUID NOT NULL REFERENCES call_sessions(call_id) ON DELETE CASCADE,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
 CREATE TABLE IF NOT EXISTS contact_invitations (
   invitation_id UUID PRIMARY KEY,
   sender_account_uid TEXT NOT NULL REFERENCES accounts(account_uid) ON DELETE CASCADE,
@@ -174,6 +180,8 @@ CREATE INDEX IF NOT EXISTS call_sessions_participants_idx
 CREATE INDEX IF NOT EXISTS call_sessions_expiry_idx ON call_sessions(expires_at);
 CREATE INDEX IF NOT EXISTS active_call_participants_call_idx
   ON active_call_participants(call_id);
+CREATE INDEX IF NOT EXISTS active_call_accounts_call_idx
+  ON active_call_accounts(call_id);
 CREATE UNIQUE INDEX IF NOT EXISTS contact_invitations_pending_pair_idx
   ON contact_invitations(
     LEAST(sender_account_uid, recipient_account_uid),
@@ -201,6 +209,13 @@ CREATE INDEX IF NOT EXISTS devices_account_uid_idx
   ON devices(account_uid) WHERE account_uid IS NOT NULL;
 
 DELETE FROM active_call_participants AS participant
+WHERE NOT EXISTS (
+  SELECT 1 FROM call_sessions AS call
+  WHERE call.call_id = participant.call_id
+    AND call.state = 'active' AND call.expires_at > NOW()
+);
+
+DELETE FROM active_call_accounts AS participant
 WHERE NOT EXISTS (
   SELECT 1 FROM call_sessions AS call
   WHERE call.call_id = participant.call_id

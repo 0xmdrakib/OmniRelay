@@ -33,6 +33,7 @@ import com.example.omnirelay.data.local.MessageEntity
 import com.example.omnirelay.data.local.OmniDatabase
 import com.example.omnirelay.data.local.OutboundEnvelopeEntity
 import com.example.omnirelay.data.local.ProcessedEnvelopeEntity
+import com.example.omnirelay.data.local.RelayCapsuleEntity
 import com.example.omnirelay.media.VoiceStreamEngine
 import com.example.omnirelay.media.TelecomCallManager
 import com.example.omnirelay.network.CallStateRequest
@@ -71,6 +72,7 @@ import kotlinx.coroutines.cancel
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.collectLatest
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.sync.Mutex
@@ -144,6 +146,12 @@ class OmniRelayService : Service() {
         private const val MAX_VOLUNTEER_RELAY_INNER_BYTES = 20_000
         private const val MAX_RELAY_PACKETS_PER_MINUTE = 240
         private const val MAX_RELAY_FANOUT_RESERVATION = 16
+        private const val MAX_STORED_RELAY_CAPSULES = 128
+        private const val MAX_STORED_RELAY_BYTES = 4L * 1024L * 1024L
+        private const val RELAY_CAPSULE_RETENTION_MS = 15L * 60L * 1_000L
+        private const val RELAY_QUEUE_RETRY_BASE_MS = 15_000L
+        private const val MAX_RELAY_QUEUE_ATTEMPTS = 4
+        private const val RELAY_QUEUE_BATCH_SIZE = 16
     }
 
     private val binder = LocalBinder()
@@ -183,6 +191,7 @@ class OmniRelayService : Service() {
     private val voicePacketRate = FixedWindowRateLimit(1_000L)
     private val outboxMutex = Mutex()
     private val mailboxSyncMutex = Mutex()
+    private val relayQueueMutex = Mutex()
     private val pairSharedKeyCache = ConcurrentHashMap<String, ByteArray>()
     private val relayReplayTracker = RelayReplayTracker(4_096)
     private val seenVoiceFrames = LinkedHashMap<String, Unit>(8_192, 0.75f, true)
@@ -190,6 +199,7 @@ class OmniRelayService : Service() {
     private var bleAdvertiseDutyJob: Job? = null
     private var incomingRingTimeoutJob: Job? = null
     private var callLeaseJob: Job? = null
+    private var relayQueueJob: Job? = null
     @Volatile private var waitingCall: WaitingCall? = null
     private val outgoingVoiceCounter = AtomicLong(0)
     @Volatile private var lastIncomingVoiceCounter = -1L
@@ -287,6 +297,7 @@ class OmniRelayService : Service() {
                 PeerDiscoveryRegistry.updatePeer(contact.secretLink, rssi, isMutualLinked = true)
                 router.updatePathTelemetry(TransportPath.LOCAL_MESH, true, 25, 0f, rssi)
             }
+            serviceScope.launch { drainRelayCapsules() }
         }
 
         bleMeshManager.onFrameReceivedListener = { frameBytes, rssi ->
@@ -304,6 +315,7 @@ class OmniRelayService : Service() {
                 )
                 router.updatePathTelemetry(TransportPath.LOCAL_MESH, true, 10, 0f, -45)
             }
+            serviceScope.launch { drainRelayCapsules() }
         }
         wifiAwareMeshManager.onFrameReceivedListener = { frameBytes ->
             if (nearbyPacketRate.tryAcquire(MAX_NEARBY_PACKETS_PER_SECOND)) {
@@ -319,6 +331,12 @@ class OmniRelayService : Service() {
                 messages.filterNot { messageProtector.isEncrypted(it.body) }.forEach { legacy ->
                     database.omniDao().updateMessageBody(legacy.messageId, messageProtector.encrypt(legacy.body))
                 }
+            }
+        }
+        relayQueueJob = serviceScope.launch {
+            while (isActive) {
+                delay(30_000L)
+                drainRelayCapsules()
             }
         }
         initializeInternetRelay()
@@ -769,7 +787,9 @@ class OmniRelayService : Service() {
         val hops = decision.maxRelayHops.coerceAtLeast(1).coerceAtMost(RelayCapsule.MAX_HOPS)
         val capsule = RelayCapsule.seal(packed, sharedKey, hops).pack()
         if (capsule.size > MAX_VOLUNTEER_RELAY_PACKET_BYTES) return false
-        return broadcastNearbyPacket(capsule) > 0
+        val neighbors = broadcastNearbyPacket(capsule)
+        if (neighbors == 0) serviceScope.launch { storeRelayCapsule(capsule) }
+        return neighbors > 0
     }
 
     private fun broadcastNearbyPacket(packet: ByteArray): Int {
@@ -777,6 +797,50 @@ class OmniRelayService : Service() {
         if (settingsManager.isWifiAwareEnabled) neighbors += wifiAwareMeshManager.broadcastPacket(packet)
         if (settingsManager.isBleEnabled) neighbors += bleMeshManager.broadcastPacket(packet)
         return neighbors
+    }
+
+    private suspend fun storeRelayCapsule(packet: ByteArray): Boolean = relayQueueMutex.withLock {
+        if (!settingsManager.isMeshRelayEnabled || packet.size > MAX_VOLUNTEER_RELAY_PACKET_BYTES) {
+            return@withLock false
+        }
+        val capsule = RelayCapsule.unpack(packet) ?: return@withLock false
+        val now = System.currentTimeMillis()
+        val dao = database.omniDao()
+        dao.pruneRelayCapsules(now, MAX_RELAY_QUEUE_ATTEMPTS)
+        val stats = dao.relayQueueStats()
+        if (stats.itemCount >= MAX_STORED_RELAY_CAPSULES ||
+            stats.totalBytes + packet.size > MAX_STORED_RELAY_BYTES
+        ) return@withLock false
+        val id = capsule.capsuleId.joinToString("") { "%02x".format(it) }
+        dao.insertRelayCapsule(
+            RelayCapsuleEntity(
+                capsuleId = id,
+                packet = packet.copyOf(),
+                expiresAtMs = now + RELAY_CAPSULE_RETENTION_MS,
+                nextAttemptAtMs = now + RELAY_QUEUE_RETRY_BASE_MS
+            )
+        ) != -1L
+    }
+
+    private suspend fun drainRelayCapsules() = relayQueueMutex.withLock {
+        if (!settingsManager.isMeshRelayEnabled) return@withLock
+        val decision = applyResourcePolicy()
+        if (!decision.isThirdPartyRelayAllowed) return@withLock
+        val now = System.currentTimeMillis()
+        val dao = database.omniDao()
+        dao.pruneRelayCapsules(now, MAX_RELAY_QUEUE_ATTEMPTS)
+        for (queued in dao.pendingRelayCapsules(now, RELAY_QUEUE_BATCH_SIZE)) {
+            if (!relayPacketRate.tryAcquire(MAX_RELAY_PACKETS_PER_MINUTE)) break
+            if (broadcastNearbyPacket(queued.packet) > 0) {
+                dao.deleteRelayCapsule(queued.capsuleId)
+            } else {
+                val multiplier = 1L shl queued.attemptCount.coerceIn(0, 3)
+                dao.deferRelayCapsule(
+                    queued.capsuleId,
+                    now + RELAY_QUEUE_RETRY_BASE_MS * multiplier
+                )
+            }
+        }
     }
 
     private suspend fun handleNearbyPacket(packet: ByteArray, rssi: Int): Boolean {
@@ -801,7 +865,9 @@ class OmniRelayService : Service() {
         if (!decision.isThirdPartyRelayAllowed ||
             !relayByteBudget.tryConsume(reservedBytes, decision.relayByteBudgetPerHour)
         ) return false
-        return broadcastNearbyPacket(forwardedBytes) > 0
+        val neighbors = broadcastNearbyPacket(forwardedBytes)
+        if (neighbors == 0) storeRelayCapsule(forwardedBytes)
+        return true
     }
 
     private fun initializeInternetRelay() {
@@ -1469,6 +1535,8 @@ class OmniRelayService : Service() {
         callState.terminateLocal()
         callLeaseJob?.cancel()
         callLeaseJob = null
+        relayQueueJob?.cancel()
+        relayQueueJob = null
         stopRingtone()
         incomingRingTimeoutJob?.cancel()
         synchronized(waitingCallLock) {

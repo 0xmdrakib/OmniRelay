@@ -909,6 +909,46 @@ export class Repository {
           await client.query("ROLLBACK");
           return { status: "participant_busy" };
         }
+        const accountRows = await client.query(
+          `SELECT account_uid FROM devices
+           WHERE device_id = ANY($1::text[]) AND account_uid IS NOT NULL`,
+          [participants]
+        );
+        const accountParticipants = accountRows.rows
+          .map((row) => row.account_uid as string)
+          .filter((value, index, values) => values.indexOf(value) === index)
+          .sort();
+        if (accountParticipants.length !== 2) {
+          await client.query("ROLLBACK");
+          return { status: "invalid" };
+        }
+        for (const accountUid of accountParticipants) {
+          await client.query(
+            "SELECT pg_advisory_xact_lock(hashtext($1))",
+            [`active-account-call:${accountUid}`]
+          );
+        }
+        await client.query(
+          `DELETE FROM active_call_accounts AS participant
+           WHERE participant.account_uid = ANY($1::text[])
+             AND NOT EXISTS (
+               SELECT 1 FROM call_sessions AS active_call
+               WHERE active_call.call_id = participant.call_id
+                 AND active_call.state = 'active' AND active_call.expires_at > NOW()
+             )`,
+          [accountParticipants]
+        );
+        const reservedAccounts = await client.query(
+          `INSERT INTO active_call_accounts(account_uid, call_id)
+           VALUES ($1, $3), ($2, $3)
+           ON CONFLICT (account_uid) DO NOTHING
+           RETURNING account_uid`,
+          [accountParticipants[0], accountParticipants[1], callId]
+        );
+        if (reservedAccounts.rowCount !== 2) {
+          await client.query("ROLLBACK");
+          return { status: "participant_busy" };
+        }
       }
       const stateTtlSeconds = state === "active" ? activeLeaseSeconds : TERMINAL_CALL_RETENTION_SECONDS;
       await client.query(
@@ -919,6 +959,7 @@ export class Repository {
       );
       if (state !== "active") {
         await client.query("DELETE FROM active_call_participants WHERE call_id = $1", [callId]);
+        await client.query("DELETE FROM active_call_accounts WHERE call_id = $1", [callId]);
       }
       const envelopeResult = await this.insertEnvelopeLocked(
         client,

@@ -848,17 +848,18 @@ test("two devices exchange, acknowledge and obtain LiveKit credentials", { skip:
   assert.match(media.url, /^wss?:\/\//);
   assert.equal(media.token.split(".").length, 3);
 
-  const receiverToOutsiderRoute = backendRouteToken(receiver, outsider);
+  const sameAccountReceiver = await registerDevice(accountBToken);
+  const outsiderToSameAccountRoute = backendRouteToken(outsider, sameAccountReceiver);
+  const sameAccountToOutsiderRoute = backendRouteToken(sameAccountReceiver, outsider);
   assert.equal(
-    (await replaceInboundRoutes(receiver, [
-      { sender, routeTokenBase64: senderToReceiverRoute },
-      { sender: outsider, routeTokenBase64: outsiderToReceiverRoute }
+    (await replaceInboundRoutes(sameAccountReceiver, [
+      { sender: outsider, routeTokenBase64: outsiderToSameAccountRoute }
     ])).status,
     204
   );
   assert.equal(
     (await replaceInboundRoutes(outsider, [
-      { sender: receiver, routeTokenBase64: receiverToOutsiderRoute }
+      { sender: sameAccountReceiver, routeTokenBase64: sameAccountToOutsiderRoute }
     ])).status,
     204
   );
@@ -868,26 +869,38 @@ test("two devices exchange, acknowledge and obtain LiveKit credentials", { skip:
     headers: auth(outsider),
     body: JSON.stringify({
       envelopeId: randomUUID(),
-      recipientDeviceId: receiver.deviceId,
+      recipientDeviceId: sameAccountReceiver.deviceId,
       kind: "call",
       callId: waitingCallId,
-      frameBase64: frame(outsider, receiver, 0x04),
-      routeTokenBase64: outsiderToReceiverRoute
+      frameBase64: frame(outsider, sameAccountReceiver, 0x04),
+      routeTokenBase64: outsiderToSameAccountRoute
     })
   });
   assert.equal(waitingRing.status, 201);
   const blockedWaitingAccept = await fetch(`${baseUrl}/v1/calls/${waitingCallId}/state`, {
     method: "POST",
-    headers: auth(receiver),
+    headers: auth(sameAccountReceiver),
     body: JSON.stringify({
       state: "active",
       envelopeId: randomUUID(),
-      frameBase64: frame(receiver, outsider, 0x05),
-      routeTokenBase64: receiverToOutsiderRoute
+      frameBase64: frame(sameAccountReceiver, outsider, 0x05),
+      routeTokenBase64: sameAccountToOutsiderRoute
     })
   });
   assert.equal(blockedWaitingAccept.status, 409);
   assert.deepEqual(await blockedWaitingAccept.json(), { error: "participant_busy" });
+
+  const endedActiveCall = await fetch(`${baseUrl}/v1/calls/${callId}/state`, {
+    method: "POST",
+    headers: auth(sender),
+    body: JSON.stringify({
+      state: "ended",
+      envelopeId: randomUUID(),
+      frameBase64: frame(sender, receiver, 0x07),
+      routeTokenBase64: senderToReceiverRoute
+    })
+  });
+  assert.equal(endedActiveCall.status, 204);
 
   assert.equal((await replaceInboundRoutes(receiver, [])).status, 204);
   const revokedRoute = await fetch(`${baseUrl}/v1/envelopes`, {
