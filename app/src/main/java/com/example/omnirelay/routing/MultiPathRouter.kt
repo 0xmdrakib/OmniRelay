@@ -29,8 +29,8 @@ data class PathTelemetry(
 )
 
 /**
- * MultiPathRouter: Sub-millisecond routing state machine evaluating RTT, loss rate,
- * signal strength, and sponsorship cost weights.
+ * MultiPathRouter: local route scoring is cheap, but radio discovery and transport handover
+ * still take real wall-clock time. Warm paths are preferred to minimize visible interruption.
  */
 class MultiPathRouter {
 

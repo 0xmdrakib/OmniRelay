@@ -375,6 +375,72 @@ test("two devices exchange, acknowledge and obtain LiveKit credentials", { skip:
     }
   );
 
+  const invitationQuotaTargets: string[] = [];
+  for (let index = 0; index < 5; index += 1) {
+    const accountUid = `integration-invite-quota-${index}`;
+    const email = `${accountUid}@example.test`;
+    const deviceId = createHash("sha256").update(`invite-device-${index}`).digest("hex");
+    invitationQuotaTargets.push(accountUid);
+    await database.query(
+      `INSERT INTO accounts(account_uid, normalized_email) VALUES ($1, $2)
+       ON CONFLICT (account_uid) DO NOTHING`,
+      [accountUid, email]
+    );
+    await database.query(
+      `INSERT INTO devices(
+         device_id, public_key_base64, signing_public_key_base64,
+         account_uid, token_hash, token_expires_at
+       ) VALUES ($1, $2, $3, $4, $5, NOW() + INTERVAL '1 day')
+       ON CONFLICT (device_id) DO NOTHING`,
+      [
+        deviceId,
+        Buffer.alloc(32, index + 21).toString("base64"),
+        Buffer.alloc(44, index + 31).toString("base64"),
+        accountUid,
+        Buffer.alloc(32, index + 41)
+      ]
+    );
+    const quotaResult = await repository.createContactInvitation(
+      randomUUID(),
+      accountAUid,
+      sender.deviceId,
+      email,
+      5,
+      20
+    );
+    if (index < 4) assert.equal(quotaResult.status, "created");
+    else assert.equal(quotaResult.status, "daily_limit");
+  }
+
+  const seededContactUids = [...invitationQuotaTargets.slice(0, 4)];
+  while (seededContactUids.length < 19) {
+    const index = seededContactUids.length;
+    const accountUid = `integration-contact-cap-${index}`;
+    seededContactUids.push(accountUid);
+    await database.query(
+      `INSERT INTO accounts(account_uid, normalized_email) VALUES ($1, $2)
+       ON CONFLICT (account_uid) DO NOTHING`,
+      [accountUid, `${accountUid}@example.test`]
+    );
+  }
+  for (const otherUid of seededContactUids) {
+    const pair = [accountAUid, otherUid].sort();
+    await database.query(
+      `INSERT INTO account_contacts(account_low_uid, account_high_uid, invited_by_account_uid)
+       VALUES ($1, $2, $3) ON CONFLICT DO NOTHING`,
+      [pair[0], pair[1], accountAUid]
+    );
+  }
+  const contactCapResult = await repository.createContactInvitation(
+    randomUUID(),
+    accountAUid,
+    sender.deviceId,
+    `${accountCUid}@example.test`,
+    5,
+    20
+  );
+  assert.equal(contactCapResult.status, "contact_limit");
+
   const oldSenderSessionToken = sender.token;
   const rotationChallengeResponse = await requestChallenge(sender, accountAToken);
   assert.equal(rotationChallengeResponse.status, 200);

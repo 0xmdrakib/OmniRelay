@@ -30,7 +30,7 @@ object PeerDiscoveryRegistry {
         hopCount: Int = 1,
         transport: String = "BLE 5.3 PAwR",
         isMutualLinked: Boolean = true,
-        quality: Int = (80..99).random()
+        quality: Int = qualityFromRssi(rssi)
     ) {
         peerMap[nodeId] = PeerNode(
             nodeId = nodeId,
@@ -62,6 +62,17 @@ object PeerDiscoveryRegistry {
     fun getMutualPeerCount(): Int = getMutualLinkedPeers().size
 
     fun getPeerCount(): Int = getActivePeers().size
+
+    fun isMutualPeerActive(nodeId: String, timeoutMs: Long = 20_000L): Boolean {
+        val peer = peerMap[nodeId] ?: return false
+        return peer.isMutualLinked && System.currentTimeMillis() - peer.lastSeenMs < timeoutMs
+    }
+
+    private fun qualityFromRssi(rssi: Int): Int = when {
+        rssi >= -50 -> 100
+        rssi <= -100 -> 0
+        else -> ((rssi + 100) * 2).coerceIn(0, 100)
+    }
 
     private fun publishSnapshot() {
         _peers.value = peerMap.values.sortedByDescending { it.lastSeenMs }

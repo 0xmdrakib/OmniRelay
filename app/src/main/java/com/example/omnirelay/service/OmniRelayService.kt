@@ -66,7 +66,9 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.async
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.launch
@@ -372,10 +374,22 @@ class OmniRelayService : Service() {
             }
             val frame = buildSecureFrame(OmniFrame.PAYLOAD_TYPE_CALL_RING, target, encodeCallId(callId))
             val envelopeId = UUID.randomUUID().toString()
-            val sentInternet = sendInternetEnvelope(frame, target, "call", callId, envelopeId)
-            val sentNearby = !sentInternet &&
+            val targetLink = Base64.encodeToString(target, Base64.NO_WRAP)
+            val directNearby = PeerDiscoveryRegistry.isMutualPeerActive(targetLink)
+            val (sentInternet, directNearbySent) = coroutineScope {
+                val internet = async {
+                    sendInternetEnvelope(frame, target, "call", callId, envelopeId)
+                }
+                val nearby = async {
+                    directNearby &&
+                        callState.matches(callId, target, CallStateMachine.Phase.OUTGOING_RINGING) &&
+                        sendNearbyFrame(target, frame)
+                }
+                internet.await() to nearby.await()
+            }
+            val sentNearby = directNearbySent || (!sentInternet &&
                 callState.matches(callId, target, CallStateMachine.Phase.OUTGOING_RINGING) &&
-                sendNearbyFrame(target, frame)
+                sendNearbyFrame(target, frame))
             if (sentNearby) database.omniDao().markOutboundSentIfPending(envelopeId)
             val sent = sentInternet || sentNearby
             if (!sent) appendChatMessage("Call queued: waiting for a network path")
@@ -515,8 +529,14 @@ class OmniRelayService : Service() {
                 "outgoing", "queued", "pending", System.currentTimeMillis()
             ))
             val frame = buildSecureFrame(OmniFrame.PAYLOAD_TYPE_TEXT, target, cleanText.toByteArray(Charsets.UTF_8))
-            val sentInternet = sendInternetEnvelope(frame, target, "message", null, messageId)
-            val sentNearby = !sentInternet && sendNearbyFrame(target, frame)
+            val targetLink = Base64.encodeToString(target, Base64.NO_WRAP)
+            val directNearby = PeerDiscoveryRegistry.isMutualPeerActive(targetLink)
+            val (sentInternet, directNearbySent) = coroutineScope {
+                val internet = async { sendInternetEnvelope(frame, target, "message", null, messageId) }
+                val nearby = async { directNearby && sendNearbyFrame(target, frame) }
+                internet.await() to nearby.await()
+            }
+            val sentNearby = directNearbySent || (!sentInternet && sendNearbyFrame(target, frame))
             if (sentNearby) {
                 if (database.omniDao().markOutboundSentIfPending(messageId) == 1) {
                     database.omniDao().updateMessageStatus(messageId, "sent", "nearby")
