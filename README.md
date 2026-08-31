@@ -1,5 +1,9 @@
 <p align="center">
-  <img src="brand/omnirelay-app-icon.svg" alt="OmniRelay logo" width="112" />
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="brand/omnirelay-mark-reverse.svg" />
+    <source media="(prefers-color-scheme: light)" srcset="brand/omnirelay-mark.svg" />
+    <img src="brand/omnirelay-mark.svg" alt="OmniRelay logo" width="72" />
+  </picture>
 </p>
 
 <h1 align="center">OmniRelay</h1>
