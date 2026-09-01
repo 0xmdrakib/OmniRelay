@@ -50,7 +50,6 @@ import com.example.omnirelay.data.local.MessageEntity
 import com.example.omnirelay.auth.GoogleAccountManager
 import com.example.omnirelay.auth.GoogleAccountProfile
 import com.example.omnirelay.auth.GoogleSignInCancelledException
-import com.example.omnirelay.auth.NoAuthorizedGoogleAccountException
 import com.example.omnirelay.network.InternetRelayClient
 import com.example.omnirelay.network.ContactInvitation
 import com.example.omnirelay.network.RelayHttpException
@@ -180,17 +179,13 @@ class MainActivity : ComponentActivity() {
                             is AccountUiState.SignedOut -> GoogleSignInScreen(
                                 isLoading = false,
                                 message = accountState.message,
-                                onAutomaticSignIn = {
-                                    authenticationScope.launch { performGoogleSignIn(true) }
-                                },
                                 onSignIn = {
-                                    authenticationScope.launch { performGoogleSignIn(false) }
+                                    authenticationScope.launch { performGoogleSignIn() }
                                 }
                             )
                             AccountUiState.SigningIn -> GoogleSignInScreen(
                                 isLoading = true,
                                 message = null,
-                                onAutomaticSignIn = {},
                                 onSignIn = {}
                             )
                             is AccountUiState.SignedIn -> MinimalAppDashboard(
@@ -301,11 +296,11 @@ class MainActivity : ComponentActivity() {
         if (!isBound) bindService(intent, serviceConnection, Context.BIND_AUTO_CREATE)
     }
 
-    private suspend fun performGoogleSignIn(authorizedAccountsOnly: Boolean) {
+    private suspend fun performGoogleSignIn() {
         if (accountUiState is AccountUiState.SigningIn) return
         accountUiState = AccountUiState.SigningIn
         try {
-            val profile = googleAccountManager.signIn(authorizedAccountsOnly)
+            val profile = googleAccountManager.signIn()
             if (!runCatching { SecureTokenStore(this).bindAccountUid(profile.uid) }.getOrDefault(false)) {
                 googleAccountManager.signOut()
                 accountUiState = AccountUiState.SignedOut(ACCOUNT_MISMATCH_MESSAGE)
@@ -313,16 +308,11 @@ class MainActivity : ComponentActivity() {
             }
             accountUiState = AccountUiState.SignedIn(profile)
             startAndBindService()
-        } catch (_: NoAuthorizedGoogleAccountException) {
-            accountUiState = AccountUiState.SignedOut()
         } catch (_: GoogleSignInCancelledException) {
-            accountUiState = AccountUiState.SignedOut(
-                if (authorizedAccountsOnly) null else "Google sign-in was cancelled."
-            )
+            accountUiState = AccountUiState.SignedOut("Google sign-in was cancelled.")
         } catch (_: Exception) {
             accountUiState = AccountUiState.SignedOut(
-                if (authorizedAccountsOnly) null
-                else "Google could not complete sign-in. Check Play Services and your connection, then try again."
+                "Google could not complete sign-in. Check Play Services and your connection, then try again."
             )
         }
     }
@@ -396,10 +386,8 @@ fun GoogleAuthConfigurationScreen() {
 fun GoogleSignInScreen(
     isLoading: Boolean,
     message: String?,
-    onAutomaticSignIn: () -> Unit,
     onSignIn: () -> Unit
 ) {
-    LaunchedEffect(Unit) { onAutomaticSignIn() }
     Box(
         modifier = Modifier
             .fillMaxSize()

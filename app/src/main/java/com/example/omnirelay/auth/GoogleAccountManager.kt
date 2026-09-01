@@ -12,7 +12,6 @@ import androidx.credentials.exceptions.GetCredentialCancellationException
 import androidx.credentials.exceptions.NoCredentialException
 import com.example.omnirelay.BuildConfig
 import com.google.android.gms.tasks.Task
-import com.google.android.libraries.identity.googleid.GetGoogleIdOption
 import com.google.android.libraries.identity.googleid.GetSignInWithGoogleOption
 import com.google.android.libraries.identity.googleid.GoogleIdTokenCredential
 import com.google.firebase.FirebaseApp
@@ -32,7 +31,6 @@ data class GoogleAccountProfile(
 data class FirebaseAccountToken(val uid: String, val idToken: String)
 
 class GoogleSignInCancelledException : IllegalStateException("Google sign-in was cancelled")
-class NoAuthorizedGoogleAccountException : IllegalStateException("No authorized Google account is available")
 class AccountAuthenticationRequiredException : IllegalStateException("Google account authentication is required")
 
 /**
@@ -57,21 +55,12 @@ class GoogleAccountManager(private val activity: ComponentActivity) {
         return user.toProfile()
     }
 
-    suspend fun signIn(authorizedAccountsOnly: Boolean): GoogleAccountProfile {
+    suspend fun signIn(): GoogleAccountProfile {
         check(isConfigured) { "Google sign-in is not configured for this build" }
         val nonce = secureNonce()
-        val option: CredentialOption = if (authorizedAccountsOnly) {
-            GetGoogleIdOption.Builder()
-                .setServerClientId(BuildConfig.GOOGLE_WEB_CLIENT_ID)
-                .setFilterByAuthorizedAccounts(true)
-                .setAutoSelectEnabled(true)
-                .setNonce(nonce)
-                .build()
-        } else {
-            GetSignInWithGoogleOption.Builder(BuildConfig.GOOGLE_WEB_CLIENT_ID)
-                .setNonce(nonce)
-                .build()
-        }
+        val option: CredentialOption = GetSignInWithGoogleOption.Builder(BuildConfig.GOOGLE_WEB_CLIENT_ID)
+            .setNonce(nonce)
+            .build()
         val request = GetCredentialRequest.Builder()
             .addCredentialOption(option)
             .build()
@@ -80,7 +69,7 @@ class GoogleAccountManager(private val activity: ComponentActivity) {
         } catch (_: GetCredentialCancellationException) {
             throw GoogleSignInCancelledException()
         } catch (_: NoCredentialException) {
-            throw NoAuthorizedGoogleAccountException()
+            throw AccountAuthenticationRequiredException()
         }
         val credential = response.credential as? CustomCredential
             ?: throw AccountAuthenticationRequiredException()
