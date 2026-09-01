@@ -207,18 +207,47 @@ class OmniRelayService : Service() {
     @Volatile private var initializationFailed = false
 
     inner class LocalBinder : Binder() {
-        fun getService(): OmniRelayService = this@OmniRelayService
+        fun getReadyService(): OmniRelayService? = this@OmniRelayService.takeIf { it.isRuntimeReady }
     }
+
+    private val isRuntimeReady: Boolean
+        get() = !initializationFailed &&
+            ::settingsManager.isInitialized &&
+            ::database.isInitialized &&
+            ::relayClient.isInitialized &&
+            ::voiceEngine.isInitialized
 
     override fun onCreate() {
         super.onCreate()
         createNotificationChannels()
-        if (!FirebaseAccountSession.isSignedIn(this)) {
+        val foregroundStarted = runCatching {
+            startForegroundServiceNotification(includeMicrophone = false)
+        }.onFailure { error ->
+            Log.e(TAG, "Android rejected foreground relay startup", error)
+        }.isSuccess
+        if (!foregroundStarted) {
             initializationFailed = true
-            Log.i(TAG, "Service startup skipped until Google authentication completes")
             stopSelf()
             return
         }
+        if (!FirebaseAccountSession.isSignedIn(this)) {
+            initializationFailed = true
+            Log.i(TAG, "Service startup skipped until Google authentication completes")
+            stopForeground(STOP_FOREGROUND_REMOVE)
+            stopSelf()
+            return
+        }
+        try {
+            initializeRuntime()
+        } catch (error: Exception) {
+            initializationFailed = true
+            Log.e(TAG, "Relay runtime initialization failed safely", error)
+            stopForeground(STOP_FOREGROUND_REMOVE)
+            stopSelf()
+        }
+    }
+
+    private fun initializeRuntime() {
         settingsManager = SettingsManager(this)
         resourceMonitor = AndroidResourceMonitor(this)
         keyPair = try {
@@ -344,25 +373,32 @@ class OmniRelayService : Service() {
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         if (initializationFailed) return START_NOT_STICKY
-        startForegroundServiceNotification(includeMicrophone = false)
-        when (intent?.action) {
-            ACTION_ACCEPT_CALL -> acceptIncomingCall()
-            ACTION_DECLINE_CALL -> declineIncomingCall()
-            ACTION_END_CALL -> stopVoiceCall()
-            ACTION_SYNC_MAILBOX -> initializeInternetRelay()
-            ACTION_SYNC_CONTACTS -> serviceScope.launch {
-                runCatching {
-                    ensureInternetRegistration(null)
-                    syncAccountContacts(notifyIncoming = true)
-                }.onFailure { Log.w(TAG, "Contact invitation sync deferred", it) }
+        return runCatching {
+            startForegroundServiceNotification(includeMicrophone = false)
+            when (intent?.action) {
+                ACTION_ACCEPT_CALL -> acceptIncomingCall()
+                ACTION_DECLINE_CALL -> declineIncomingCall()
+                ACTION_END_CALL -> stopVoiceCall()
+                ACTION_SYNC_MAILBOX -> initializeInternetRelay()
+                ACTION_SYNC_CONTACTS -> serviceScope.launch {
+                    runCatching {
+                        ensureInternetRegistration(null)
+                        syncAccountContacts(notifyIncoming = true)
+                    }.onFailure { Log.w(TAG, "Contact invitation sync deferred", it) }
+                }
+                ACTION_UPDATE_PUSH_TOKEN -> intent.getStringExtra(EXTRA_PUSH_TOKEN)?.let { token ->
+                    serviceScope.launch { updatePushToken(token) }
+                }
             }
-            ACTION_UPDATE_PUSH_TOKEN -> intent.getStringExtra(EXTRA_PUSH_TOKEN)?.let { token ->
-                serviceScope.launch { updatePushToken(token) }
-            }
-        }
 
-        applyResourcePolicy()
-        return START_STICKY
+            applyResourcePolicy()
+            START_STICKY
+        }.getOrElse { error ->
+            initializationFailed = true
+            Log.e(TAG, "Foreground relay startup failed safely", error)
+            stopSelf()
+            START_NOT_STICKY
+        }
     }
 
     fun setAppInForeground(isForeground: Boolean) {
@@ -1529,7 +1565,7 @@ class OmniRelayService : Service() {
         Log.i(TAG, message)
     }
 
-    override fun onBind(intent: Intent?): IBinder = binder
+    override fun onBind(intent: Intent?): IBinder? = binder.takeIf { isRuntimeReady }
 
     override fun onDestroy() {
         callState.terminateLocal()

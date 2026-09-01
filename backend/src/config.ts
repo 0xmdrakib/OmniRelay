@@ -1,10 +1,19 @@
 import { z } from "zod";
 
+const postgresUrl = z.string().min(1).refine(
+  (value) => value.startsWith("postgres://") || value.startsWith("postgresql://"),
+  "must be a PostgreSQL connection URL"
+);
+
 const schema = z.object({
   NODE_ENV: z.enum(["development", "test", "production"]).default("development"),
   PORT: z.coerce.number().int().min(1).max(65535).default(8080),
   HOST: z.string().default("0.0.0.0"),
-  DATABASE_URL: z.string().min(1).default("postgres://omnirelay:omnirelay@localhost:5432/omnirelay"),
+  DATABASE_URL: postgresUrl.default("postgres://omnirelay:omnirelay@localhost:5432/omnirelay"),
+  DATABASE_MIGRATION_URL: z.preprocess(
+    (value) => value === "" ? undefined : value,
+    postgresUrl.optional()
+  ),
   DATABASE_POOL_MAX: z.coerce.number().int().min(1).max(32).default(4),
   DATABASE_POOL_IDLE_TIMEOUT_MS: z.coerce.number().int().min(1_000).max(300_000).default(30_000),
   DATABASE_CONNECTION_TIMEOUT_MS: z.coerce.number().int().min(250).max(30_000).default(5_000),
@@ -18,6 +27,14 @@ const schema = z.object({
   FIREBASE_SERVICE_ACCOUNT_JSON: z.preprocess(
     (value) => value === "" ? undefined : value,
     z.string().min(2).max(65_536).optional()
+  ),
+  GOOGLE_APPLICATION_CREDENTIALS: z.preprocess(
+    (value) => value === "" ? undefined : value,
+    z.string().min(1).max(4_096).optional()
+  ),
+  FIREBASE_PROJECT_ID: z.preprocess(
+    (value) => value === "" ? undefined : value,
+    z.string().regex(/^[a-z][a-z0-9-]{4,28}[a-z0-9]$/).optional()
   ),
   MESSAGE_TTL_DAYS: z.coerce.number().int().min(1).max(90).default(30),
   CALL_SIGNAL_TTL_SECONDS: z.coerce.number().int().min(15).max(300).default(60),

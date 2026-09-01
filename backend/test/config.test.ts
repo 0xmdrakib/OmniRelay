@@ -5,6 +5,7 @@ import { parseConfig } from "../src/config.js";
 test("resource controls use conservative defaults", () => {
   const parsed = parseConfig({ NODE_ENV: "test" });
   assert.equal(parsed.DATABASE_POOL_MAX, 4);
+  assert.equal(parsed.DATABASE_MIGRATION_URL, undefined);
   assert.equal(parsed.DATABASE_POOL_IDLE_TIMEOUT_MS, 30_000);
   assert.equal(parsed.DATABASE_CONNECTION_TIMEOUT_MS, 5_000);
   assert.equal(parsed.DATABASE_QUERY_TIMEOUT_MS, 12_000);
@@ -22,6 +23,8 @@ test("resource controls use conservative defaults", () => {
   assert.equal(parsed.MAX_REGISTRATION_CHALLENGES_PER_DEVICE, 4);
   assert.equal(parsed.MAX_REGISTRATION_CHALLENGES_PER_ACCOUNT, 16);
   assert.equal(parsed.FIREBASE_SERVICE_ACCOUNT_JSON, undefined);
+  assert.equal(parsed.GOOGLE_APPLICATION_CREDENTIALS, undefined);
+  assert.equal(parsed.FIREBASE_PROJECT_ID, undefined);
   assert.equal(parsed.MAX_PENDING_MESSAGES_PER_PAIR, 100);
   assert.equal(parsed.CALL_MAX_FUTURE_SKEW_SECONDS, 15);
 });
@@ -115,6 +118,18 @@ test("unsafe resource relationships are rejected", () => {
   assert.throws(
     () => parseConfig({ NODE_ENV: "test", FIREBASE_SERVICE_ACCOUNT_JSON: "x".repeat(65_537) }),
     /FIREBASE_SERVICE_ACCOUNT_JSON/
+  );
+  assert.throws(
+    () => parseConfig({ NODE_ENV: "test", GOOGLE_APPLICATION_CREDENTIALS: "x".repeat(4_097) }),
+    /GOOGLE_APPLICATION_CREDENTIALS/
+  );
+  assert.throws(
+    () => parseConfig({ NODE_ENV: "test", FIREBASE_PROJECT_ID: "Not a valid project id" }),
+    /FIREBASE_PROJECT_ID/
+  );
+  assert.throws(
+    () => parseConfig({ NODE_ENV: "test", DATABASE_URL: "https://not-postgres.example" }),
+    /PostgreSQL connection URL/
   );
 });
 

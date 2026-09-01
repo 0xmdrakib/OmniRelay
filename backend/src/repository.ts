@@ -140,7 +140,18 @@ export class Repository {
   }
 
   async migrate(): Promise<void> {
-    await this.pool.query(schemaSql);
+    const client = await this.pool.connect();
+    try {
+      await client.query("BEGIN");
+      await client.query("SELECT pg_advisory_xact_lock(hashtext($1))", ["omnirelay-schema-v2"]);
+      await client.query(schemaSql);
+      await client.query("COMMIT");
+    } catch (error) {
+      await client.query("ROLLBACK").catch(() => undefined);
+      throw error;
+    } finally {
+      client.release();
+    }
   }
 
   async health(): Promise<void> {

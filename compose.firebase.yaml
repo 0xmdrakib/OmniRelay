@@ -1,0 +1,10 @@
+services:
+  backend:
+    environment:
+      # The Admin SDK reads the mounted key through Application Default
+      # Credentials. Private key material never appears in Docker env data.
+      GOOGLE_APPLICATION_CREDENTIALS: /run/secrets/firebase-admin.json
+      FIREBASE_PROJECT_ID: ${FIREBASE_PROJECT_ID:?Set FIREBASE_PROJECT_ID in .env}
+      FIREBASE_SERVICE_ACCOUNT_JSON: ""
+    volumes:
+      - ./.secrets/firebase-admin.json:/run/secrets/firebase-admin.json:ro

@@ -84,6 +84,8 @@ $lines = @(
     "TRUST_PROXY=false",
     "RELAY_DOMAIN=relay.localhost",
     "LIVEKIT_DOMAIN=livekit.localhost",
+    "FIREBASE_PROJECT_ID=omnirelay-a3f00",
+    "GOOGLE_APPLICATION_CREDENTIALS=",
     "FIREBASE_SERVICE_ACCOUNT_JSON="
 )
 

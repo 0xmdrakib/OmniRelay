@@ -16,9 +16,11 @@ class TelecomCallManager(
     private val onSystemAnswer: () -> Unit,
     private val onSystemDisconnect: () -> Unit
 ) {
-    private val callsManager = CallsManager(context.applicationContext).also {
-        it.registerAppWithTelecom(CallsManager.CAPABILITY_BASELINE)
-    }
+    private val callsManager = runCatching {
+        CallsManager(context.applicationContext).also {
+            it.registerAppWithTelecom(CallsManager.CAPABILITY_BASELINE)
+        }
+    }.getOrNull()
     @Volatile private var control: CallControlScope? = null
 
     fun reportIncoming(displayName: String, callId: String) {
@@ -31,6 +33,7 @@ class TelecomCallManager(
 
     private fun addCall(displayName: String, callId: String, direction: Int) {
         scope.launch {
+            val manager = callsManager ?: return@launch
             val attributes = CallAttributesCompat(
                 displayName,
                 Uri.parse("omnirelay:$callId"),
@@ -38,7 +41,7 @@ class TelecomCallManager(
                 CallAttributesCompat.CALL_TYPE_AUDIO_CALL,
                 CallAttributesCompat.SUPPORTS_SET_INACTIVE
             )
-            callsManager.addCall(
+            runCatching { manager.addCall(
                 attributes,
                 onAnswer = { onSystemAnswer() },
                 onDisconnect = { onSystemDisconnect() },
@@ -46,7 +49,7 @@ class TelecomCallManager(
                 onSetInactive = {}
             ) {
                 control = this
-            }
+            } }
         }
     }
 

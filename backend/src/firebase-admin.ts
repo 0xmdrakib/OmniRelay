@@ -1,4 +1,5 @@
 import {
+  applicationDefault,
   cert,
   getApps,
   initializeApp,
@@ -36,9 +37,15 @@ function serviceAccountFromJson(serviceAccountJson: string): ServiceAccount {
 export function getOrCreateFirebaseAdminApp(serviceAccountJson?: string): App | null {
   const existing = getApps()[0];
   if (existing) return existing;
-  if (!serviceAccountJson) return null;
+  const applicationCredentialsPath = process.env.GOOGLE_APPLICATION_CREDENTIALS;
+  if (!serviceAccountJson && !applicationCredentialsPath) return null;
   try {
-    return initializeApp({ credential: cert(serviceAccountFromJson(serviceAccountJson)) });
+    return initializeApp({
+      credential: serviceAccountJson
+        ? cert(serviceAccountFromJson(serviceAccountJson))
+        : applicationDefault(),
+      projectId: process.env.FIREBASE_PROJECT_ID
+    });
   } catch {
     throw new Error("Invalid Firebase Admin service account configuration");
   }

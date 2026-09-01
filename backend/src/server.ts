@@ -839,9 +839,24 @@ export async function buildServer(repository = createRepository(), overrides: Bu
 
 export async function startServer() {
   const repository = createRepository();
+  const migrationRepository = config.DATABASE_MIGRATION_URL &&
+      config.DATABASE_MIGRATION_URL !== config.DATABASE_URL
+    ? new Repository(config.DATABASE_MIGRATION_URL, {
+      maxConnections: 1,
+      idleTimeoutMillis: config.DATABASE_POOL_IDLE_TIMEOUT_MS,
+      connectionTimeoutMillis: config.DATABASE_CONNECTION_TIMEOUT_MS,
+      queryTimeoutMillis: config.DATABASE_QUERY_TIMEOUT_MS,
+      statementTimeoutMillis: config.DATABASE_STATEMENT_TIMEOUT_MS,
+      maxUses: 100
+    })
+    : repository;
   let app: Awaited<ReturnType<typeof buildServer>> | null = null;
   try {
-    await repository.migrate();
+    try {
+      await migrationRepository.migrate();
+    } finally {
+      if (migrationRepository !== repository) await migrationRepository.close();
+    }
     app = await buildServer(repository);
     await app.listen({ host: config.HOST, port: config.PORT });
   } catch (error) {

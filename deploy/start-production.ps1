@@ -17,9 +17,27 @@ if ((Get-Content -Raw -LiteralPath $envPath) -match 'CHANGE_ME|example\.invalid'
 
 Push-Location $repoRoot
 try {
-    docker compose --profile production config --quiet
+    $composeArguments = @("compose", "-f", "compose.yaml")
+    $firebaseKey = Join-Path $repoRoot ".secrets\firebase-admin.json"
+    if (Test-Path -LiteralPath $firebaseKey -PathType Leaf) {
+        $composeArguments += @("-f", "compose.firebase.yaml")
+    }
+    $databaseUrl = Get-Content -LiteralPath $envPath |
+        Where-Object { $_.StartsWith("DATABASE_URL=") } |
+        Select-Object -First 1
+    $usingNeon = $databaseUrl -and $databaseUrl.Substring("DATABASE_URL=".Length).Contains(".neon.tech")
+    if ($usingNeon) {
+        $composeArguments += @("-f", "compose.neon.yaml")
+    }
+    $composeArguments += @("--profile", "production")
+
+    docker @composeArguments config --quiet
     if ($LASTEXITCODE -ne 0) { throw "Docker Compose configuration validation failed." }
-    docker compose --profile production up -d --build
+    if ($usingNeon) {
+        docker @composeArguments up -d --build --no-deps backend livekit coturn caddy
+    } else {
+        docker @composeArguments up -d --build
+    }
     if ($LASTEXITCODE -ne 0) { throw "Docker Compose deployment failed." }
 
     $deadline = (Get-Date).AddMinutes(2)
@@ -36,7 +54,7 @@ try {
     if (-not $healthy) {
         throw "Relay did not become production-ready within two minutes. Check PostgreSQL and Firebase Admin configuration."
     }
-    docker compose --profile production ps
+    docker @composeArguments ps
     Write-Output "OmniRelay production services are healthy."
 } finally {
     Pop-Location

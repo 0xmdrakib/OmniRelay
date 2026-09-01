@@ -109,20 +109,42 @@ class MainActivity : ComponentActivity() {
     private var permissionRevision by mutableIntStateOf(0)
     private var pendingPermissionRationale by mutableStateOf<PermissionRequestGroup?>(null)
     private var identityStartupError by mutableStateOf<String?>(null)
+    private var relayRuntimeMessage by mutableStateOf<String?>(null)
     private lateinit var googleAccountManager: GoogleAccountManager
     private var accountUiState by mutableStateOf<AccountUiState>(AccountUiState.Unconfigured)
 
     private val serviceConnection = object : ServiceConnection {
         override fun onServiceConnected(name: ComponentName?, service: IBinder?) {
-            val binder = service as OmniRelayService.LocalBinder
-            omniService = binder.getService()
-            isBound = true
-            omniService?.setAppInForeground(activityStarted)
+            val readyService = (service as? OmniRelayService.LocalBinder)?.getReadyService()
+            if (readyService == null) {
+                omniService = null
+                relayRuntimeMessage = "Secure relay could not start. Your account is still signed in—retry by reopening the app."
+                if (isBound) runCatching { unbindService(this) }
+                isBound = false
+                return
+            }
+            omniService = readyService
+            relayRuntimeMessage = null
+            readyService.setAppInForeground(activityStarted)
         }
 
         override fun onServiceDisconnected(name: ComponentName?) {
             omniService = null
+            relayRuntimeMessage = "Secure relay stopped unexpectedly. Reopen the app to reconnect."
+        }
+
+        override fun onNullBinding(name: ComponentName?) {
+            omniService = null
+            relayRuntimeMessage = "Secure relay could not initialize on this device."
+            if (isBound) runCatching { unbindService(this) }
             isBound = false
+        }
+
+        override fun onBindingDied(name: ComponentName?) {
+            omniService = null
+            if (isBound) runCatching { unbindService(this) }
+            isBound = false
+            relayRuntimeMessage = "Secure relay restarted. Return to the app to reconnect."
         }
     }
 
@@ -194,6 +216,7 @@ class MainActivity : ComponentActivity() {
                             )
                             is AccountUiState.SignedIn -> MinimalAppDashboard(
                                 omniService = omniService,
+                                relayRuntimeMessage = relayRuntimeMessage,
                                 permissionPlan = permissionPlan,
                                 accountProfile = accountState.profile,
                                 onSignOut = {
@@ -232,6 +255,9 @@ class MainActivity : ComponentActivity() {
         super.onStart()
         activityStarted = true
         omniService?.setAppInForeground(true)
+        if (accountUiState is AccountUiState.SignedIn && omniService == null && !isBound) {
+            startAndBindService()
+        }
     }
 
     override fun onResume() {
@@ -296,8 +322,18 @@ class MainActivity : ComponentActivity() {
     private fun startAndBindService() {
         if (identityStartupError != null || accountUiState !is AccountUiState.SignedIn) return
         val intent = Intent(this, OmniRelayService::class.java)
-        runCatching { ContextCompat.startForegroundService(this, intent) }
-        if (!isBound) bindService(intent, serviceConnection, Context.BIND_AUTO_CREATE)
+        val started = runCatching { ContextCompat.startForegroundService(this, intent) }
+            .onFailure {
+                relayRuntimeMessage = "Android blocked secure relay startup. Reopen the app and allow requested permissions."
+            }
+            .isSuccess
+        if (!started || isBound) return
+        isBound = runCatching { bindService(intent, serviceConnection, Context.BIND_AUTO_CREATE) }
+            .getOrElse {
+                relayRuntimeMessage = "Secure relay binding failed. Reopen the app to retry."
+                false
+            }
+        if (!isBound) relayRuntimeMessage = "Secure relay is unavailable on this device."
     }
 
     private suspend fun performGoogleSignIn() {
@@ -397,121 +433,176 @@ fun GoogleSignInScreen(
     message: String?,
     onSignIn: () -> Unit
 ) {
-    Box(
+    Column(
         modifier = Modifier
             .fillMaxSize()
             .background(
-                Brush.linearGradient(
-                    listOf(Color(0xFFF3F2F8), Color(0xFFFFF4EC), Color(0xFFEDE9FF))
+                Brush.verticalGradient(
+                    listOf(Color(0xFFFFFCF7), Color(0xFFF5F3FA), Color(0xFFF0EDF8))
                 )
             )
-            .padding(24.dp),
-        contentAlignment = Alignment.Center
+            .statusBarsPadding()
+            .navigationBarsPadding()
+            .verticalScroll(rememberScrollState())
+            .padding(horizontal = 26.dp, vertical = 22.dp),
+        horizontalAlignment = Alignment.CenterHorizontally
     ) {
-        Card(
+        Column(
             modifier = Modifier
                 .fillMaxWidth()
-                .widthIn(max = 480.dp)
-                .verticalScroll(rememberScrollState()),
-            shape = RoundedCornerShape(30.dp),
-            colors = CardDefaults.cardColors(containerColor = Color.White),
-            elevation = CardDefaults.cardElevation(defaultElevation = 4.dp)
+                .widthIn(max = 440.dp),
+            horizontalAlignment = Alignment.Start
         ) {
-            Column(modifier = Modifier.padding(28.dp), horizontalAlignment = Alignment.CenterHorizontally) {
+            Spacer(Modifier.height(18.dp))
+            Row(verticalAlignment = Alignment.CenterVertically) {
                 Box(
                     modifier = Modifier
-                        .size(64.dp)
-                        .clip(RoundedCornerShape(20.dp))
-                        .background(Color(0xFFFFFAF0))
-                        .border(1.dp, Color(0xFFE7E0D5), RoundedCornerShape(20.dp)),
+                        .size(52.dp)
+                        .clip(RoundedCornerShape(16.dp))
+                        .background(Color(0xFF111111)),
                     contentAlignment = Alignment.Center
                 ) {
                     Image(
                         painter = painterResource(R.drawable.ic_brand_mark),
                         contentDescription = "OmniRelay",
-                        modifier = Modifier.size(42.dp)
+                        modifier = Modifier.size(34.dp)
                     )
                 }
-                Spacer(Modifier.height(20.dp))
-                Text(
-                    "Stay connected, privately.",
-                    fontWeight = FontWeight.Black,
-                    fontSize = 25.sp,
-                    color = Color(0xFF1E1C2E)
-                )
-                Spacer(Modifier.height(8.dp))
-                Text(
-                    "Sign in to invite people you trust and keep your secure contacts ready when you need them.",
-                    color = Color(0xFF7E7E9A),
-                    fontSize = 13.sp,
-                    lineHeight = 20.sp,
-                    textAlign = androidx.compose.ui.text.style.TextAlign.Center
-                )
-                Spacer(Modifier.height(22.dp))
-                SignInBenefitRow(
-                    icon = Icons.Default.PersonAdd,
-                    title = "Invite trusted contacts",
-                    description = "Connect by Google email—no public contact directory."
-                )
-                Spacer(Modifier.height(10.dp))
-                SignInBenefitRow(
-                    icon = Icons.Default.Lock,
-                    title = "Private by default",
-                    description = "Your messages and calls stay end-to-end encrypted."
-                )
-                Spacer(Modifier.height(10.dp))
-                SignInBenefitRow(
-                    icon = Icons.Default.Sync,
-                    title = "Your contacts stay with you",
-                    description = "Keep invitations and mutual contacts linked to your account."
-                )
-                if (message != null) {
-                    Spacer(Modifier.height(14.dp))
+                Spacer(Modifier.width(13.dp))
+                Column {
                     Text(
-                        message,
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .background(Color(0xFFFFF0F0), RoundedCornerShape(12.dp))
-                            .padding(horizontal = 14.dp, vertical = 11.dp),
-                        color = Color(0xFFB4232D),
-                        fontSize = 12.sp,
-                        lineHeight = 17.sp
+                        "OMNIRELAY",
+                        color = Color(0xFF17151E),
+                        fontWeight = FontWeight.Black,
+                        fontSize = 15.sp,
+                        letterSpacing = 1.4.sp
+                    )
+                    Text(
+                        "Private communication, intelligently routed",
+                        color = Color(0xFF77727F),
+                        fontSize = 11.sp
                     )
                 }
-                Spacer(Modifier.height(20.dp))
-                Button(
-                    onClick = onSignIn,
-                    enabled = !isLoading,
-                    modifier = Modifier.fillMaxWidth().height(52.dp),
-                    shape = RoundedCornerShape(14.dp),
-                    colors = ButtonDefaults.buttonColors(
-                        containerColor = Color(0xFF1E1C2E),
-                        contentColor = Color.White,
-                        disabledContainerColor = Color(0xFF1E1C2E),
-                        disabledContentColor = Color.White
+            }
+
+            Spacer(Modifier.height(46.dp))
+            Text(
+                "Your people.\nYour privacy.",
+                fontWeight = FontWeight.Black,
+                fontSize = 40.sp,
+                lineHeight = 43.sp,
+                letterSpacing = (-1.2).sp,
+                color = Color(0xFF17151E)
+            )
+            Spacer(Modifier.height(16.dp))
+            Text(
+                "Sign in once to invite trusted contacts and keep encrypted messages and calls ready across every available path.",
+                color = Color(0xFF6D6875),
+                fontSize = 15.sp,
+                lineHeight = 23.sp
+            )
+
+            Spacer(Modifier.height(30.dp))
+            Surface(
+                modifier = Modifier.fillMaxWidth(),
+                shape = RoundedCornerShape(22.dp),
+                color = Color.White.copy(alpha = 0.82f),
+                border = androidx.compose.foundation.BorderStroke(1.dp, Color(0xFFE4DFE8))
+            ) {
+                Column(modifier = Modifier.padding(horizontal = 18.dp, vertical = 6.dp)) {
+                    SignInBenefitRow(
+                        icon = Icons.Default.PersonAdd,
+                        title = "Invite by email",
+                        description = "Only approved mutual contacts can reach you."
                     )
+                    HorizontalDivider(color = Color(0xFFECE8EF))
+                    SignInBenefitRow(
+                        icon = Icons.Default.Lock,
+                        title = "Encrypted before delivery",
+                        description = "Relays route sealed data—they cannot read it."
+                    )
+                }
+            }
+
+            if (message != null) {
+                Spacer(Modifier.height(16.dp))
+                Surface(
+                    modifier = Modifier.fillMaxWidth(),
+                    shape = RoundedCornerShape(14.dp),
+                    color = Color(0xFFFFEDEB)
                 ) {
-                    if (isLoading) {
-                        CircularProgressIndicator(
-                            modifier = Modifier.size(20.dp),
-                            color = Color.White,
-                            strokeWidth = 2.dp
+                    Row(
+                        modifier = Modifier.padding(horizontal = 14.dp, vertical = 12.dp),
+                        verticalAlignment = Alignment.Top
+                    ) {
+                        Icon(
+                            Icons.Default.Info,
+                            contentDescription = null,
+                            tint = Color(0xFFB63838),
+                            modifier = Modifier.size(18.dp)
                         )
                         Spacer(Modifier.width(10.dp))
-                        Text("CHECKING ACCOUNT", fontWeight = FontWeight.Bold)
-                    } else {
-                        Text("G", fontWeight = FontWeight.Black, fontSize = 18.sp)
-                        Spacer(Modifier.width(12.dp))
-                        Text("CONTINUE WITH GOOGLE", fontWeight = FontWeight.Bold)
+                        Text(
+                            message,
+                            color = Color(0xFF8F2F32),
+                            fontSize = 12.sp,
+                            lineHeight = 17.sp
+                        )
                     }
                 }
-                Spacer(Modifier.height(16.dp))
+            }
+        }
+
+        Spacer(Modifier.height(34.dp))
+        Column(
+            modifier = Modifier.fillMaxWidth().widthIn(max = 440.dp),
+            horizontalAlignment = Alignment.CenterHorizontally
+        ) {
+            OutlinedButton(
+                onClick = onSignIn,
+                enabled = !isLoading,
+                modifier = Modifier.fillMaxWidth().height(56.dp),
+                shape = RoundedCornerShape(16.dp),
+                border = androidx.compose.foundation.BorderStroke(1.dp, Color(0xFFD8D3DC)),
+                colors = ButtonDefaults.outlinedButtonColors(
+                    containerColor = Color.White,
+                    contentColor = Color(0xFF25212A),
+                    disabledContainerColor = Color.White,
+                    disabledContentColor = Color(0xFF77727F)
+                )
+            ) {
+                if (isLoading) {
+                    CircularProgressIndicator(
+                        modifier = Modifier.size(20.dp),
+                        color = Color(0xFF5C4BC8),
+                        strokeWidth = 2.dp
+                    )
+                    Spacer(Modifier.width(12.dp))
+                    Text("Signing in…", fontWeight = FontWeight.Bold, fontSize = 14.sp)
+                } else {
+                    Image(
+                        painter = painterResource(R.drawable.ic_google_g),
+                        contentDescription = null,
+                        modifier = Modifier.size(20.dp)
+                    )
+                    Spacer(Modifier.width(12.dp))
+                    Text("Continue with Google", fontWeight = FontWeight.Bold, fontSize = 14.sp)
+                }
+            }
+            Spacer(Modifier.height(13.dp))
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Icon(
+                    Icons.Default.VerifiedUser,
+                    contentDescription = null,
+                    tint = Color(0xFF77727F),
+                    modifier = Modifier.size(14.dp)
+                )
+                Spacer(Modifier.width(6.dp))
                 Text(
-                    "Google verifies your account. OmniRelay never receives your Google password.",
-                    color = Color(0xFF9A9AB0),
-                    fontSize = 11.sp,
-                    lineHeight = 16.sp,
-                    textAlign = androidx.compose.ui.text.style.TextAlign.Center
+                    "Google verifies your identity. OmniRelay never sees your password.",
+                    color = Color(0xFF77727F),
+                    fontSize = 10.sp,
+                    lineHeight = 14.sp
                 )
             }
         }
@@ -527,23 +618,22 @@ private fun SignInBenefitRow(
     Row(
         modifier = Modifier
             .fillMaxWidth()
-            .background(Color(0xFFF7F6FA), RoundedCornerShape(16.dp))
-            .padding(13.dp),
+            .padding(vertical = 13.dp),
         verticalAlignment = Alignment.CenterVertically
     ) {
         Box(
             modifier = Modifier
                 .size(38.dp)
-                .background(Color(0xFFECE8FF), RoundedCornerShape(12.dp)),
+                .background(Color(0xFFEDE9F7), RoundedCornerShape(12.dp)),
             contentAlignment = Alignment.Center
         ) {
-            Icon(icon, contentDescription = null, tint = Color(0xFF5C4BC8), modifier = Modifier.size(19.dp))
+            Icon(icon, contentDescription = null, tint = Color(0xFF50448D), modifier = Modifier.size(19.dp))
         }
         Spacer(Modifier.width(12.dp))
         Column {
-            Text(title, color = Color(0xFF1E1C2E), fontWeight = FontWeight.Bold, fontSize = 13.sp)
+            Text(title, color = Color(0xFF211E27), fontWeight = FontWeight.Bold, fontSize = 13.sp)
             Spacer(Modifier.height(2.dp))
-            Text(description, color = Color(0xFF74748A), fontSize = 11.sp, lineHeight = 16.sp)
+            Text(description, color = Color(0xFF77727F), fontSize = 11.sp, lineHeight = 16.sp)
         }
     }
 }
@@ -569,6 +659,7 @@ fun IdentityUnavailableScreen(message: String) {
 @Composable
 fun MinimalAppDashboard(
     omniService: OmniRelayService?,
+    relayRuntimeMessage: String?,
     permissionPlan: CapabilityPlan,
     accountProfile: GoogleAccountProfile,
     onSignOut: () -> Unit,
@@ -699,6 +790,33 @@ fun MinimalAppDashboard(
                             color = Color(0xFF6C5CE7),
                             fontSize = 11.sp,
                             fontWeight = FontWeight.Bold
+                        )
+                    }
+                }
+            }
+
+            if (relayRuntimeMessage != null) {
+                Surface(
+                    modifier = Modifier.fillMaxWidth().padding(horizontal = 20.dp, vertical = 2.dp),
+                    shape = RoundedCornerShape(14.dp),
+                    color = Color(0xFFFFECE8)
+                ) {
+                    Row(
+                        modifier = Modifier.padding(horizontal = 14.dp, vertical = 11.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Icon(
+                            Icons.Default.WarningAmber,
+                            contentDescription = null,
+                            tint = Color(0xFF9E3C31),
+                            modifier = Modifier.size(18.dp)
+                        )
+                        Spacer(Modifier.width(9.dp))
+                        Text(
+                            relayRuntimeMessage,
+                            color = Color(0xFF7F3029),
+                            fontSize = 11.sp,
+                            lineHeight = 16.sp
                         )
                     }
                 }

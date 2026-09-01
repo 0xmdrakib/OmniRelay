@@ -70,6 +70,8 @@ $lines = @(
     "TRUST_PROXY=true",
     "RELAY_DOMAIN=$RelayDomain",
     "LIVEKIT_DOMAIN=$LiveKitDomain",
+    "FIREBASE_PROJECT_ID=omnirelay-a3f00",
+    "GOOGLE_APPLICATION_CREDENTIALS=",
     "FIREBASE_SERVICE_ACCOUNT_JSON="
 )
 
@@ -85,4 +87,4 @@ $lines = @(
     -TurnSharedSecret $turnSharedSecret | Out-Null
 
 Write-Output "Created ignored .env and deploy/livekit.generated.yaml."
-Write-Output "Add FIREBASE_SERVICE_ACCOUNT_JSON to .env when FCM is ready, then run deploy/start-production.ps1."
+Write-Output "Mount a Firebase Admin key with compose.firebase.yaml before starting production."
