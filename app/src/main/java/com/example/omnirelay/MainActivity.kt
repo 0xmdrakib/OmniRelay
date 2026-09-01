@@ -53,6 +53,7 @@ import com.example.omnirelay.data.local.MessageEntity
 import com.example.omnirelay.auth.GoogleAccountManager
 import com.example.omnirelay.auth.GoogleAccountProfile
 import com.example.omnirelay.auth.GoogleSignInCancelledException
+import com.example.omnirelay.auth.AccountAuthenticationRequiredException
 import com.example.omnirelay.network.InternetRelayClient
 import com.example.omnirelay.network.ContactInvitation
 import com.example.omnirelay.network.RelayHttpException
@@ -313,9 +314,14 @@ class MainActivity : ComponentActivity() {
             startAndBindService()
         } catch (_: GoogleSignInCancelledException) {
             accountUiState = AccountUiState.SignedOut("Google sign-in was cancelled.")
+        } catch (_: AccountAuthenticationRequiredException) {
+            accountUiState = AccountUiState.SignedOut(
+                "Google couldn't open the account picker. Add a Google account to this phone, " +
+                    "update Google Play services, and try again."
+            )
         } catch (_: Exception) {
             accountUiState = AccountUiState.SignedOut(
-                "Google could not complete sign-in. Check Play Services and your connection, then try again."
+                "Google couldn't complete sign-in. Check your connection and try again."
             )
         }
     }
