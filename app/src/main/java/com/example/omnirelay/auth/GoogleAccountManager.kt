@@ -2,18 +2,23 @@ package com.example.omnirelay.auth
 
 import android.content.Context
 import android.util.Base64
+import android.util.Log
 import androidx.activity.ComponentActivity
 import androidx.credentials.ClearCredentialStateRequest
 import androidx.credentials.CredentialManager
-import androidx.credentials.CredentialOption
 import androidx.credentials.CustomCredential
 import androidx.credentials.GetCredentialRequest
 import androidx.credentials.exceptions.GetCredentialCancellationException
+import androidx.credentials.exceptions.GetCredentialException
+import androidx.credentials.exceptions.GetCredentialInterruptedException
+import androidx.credentials.exceptions.GetCredentialProviderConfigurationException
+import androidx.credentials.exceptions.GetCredentialUnsupportedException
 import androidx.credentials.exceptions.NoCredentialException
 import com.example.omnirelay.BuildConfig
 import com.google.android.gms.tasks.Task
-import com.google.android.libraries.identity.googleid.GetSignInWithGoogleOption
+import com.google.android.libraries.identity.googleid.GetGoogleIdOption
 import com.google.android.libraries.identity.googleid.GoogleIdTokenCredential
+import com.google.android.libraries.identity.googleid.GoogleIdTokenParsingException
 import com.google.firebase.FirebaseApp
 import com.google.firebase.auth.FirebaseAuth
 import com.google.firebase.auth.GoogleAuthProvider
@@ -30,8 +35,20 @@ data class GoogleAccountProfile(
 
 data class FirebaseAccountToken(val uid: String, val idToken: String)
 
-class GoogleSignInCancelledException : IllegalStateException("Google sign-in was cancelled")
-class AccountAuthenticationRequiredException : IllegalStateException("Google account authentication is required")
+class GoogleSignInCancelledException(cause: Throwable? = null) :
+    IllegalStateException("Google sign-in did not finish", cause)
+
+class AccountAuthenticationRequiredException(cause: Throwable? = null) :
+    IllegalStateException("Google account authentication is required", cause)
+
+class GoogleSignInInterruptedException(cause: Throwable) :
+    IllegalStateException("Google sign-in was interrupted", cause)
+
+class GoogleSignInConfigurationException(cause: Throwable) :
+    IllegalStateException("Google sign-in provider configuration is unavailable", cause)
+
+class GoogleSignInUnavailableException(cause: Throwable) :
+    IllegalStateException("Google sign-in is unavailable on this device", cause)
 
 /**
  * Credential Manager + Firebase Authentication bridge.
@@ -58,7 +75,10 @@ class GoogleAccountManager(private val activity: ComponentActivity) {
     suspend fun signIn(): GoogleAccountProfile {
         check(isConfigured) { "Google sign-in is not configured for this build" }
         val nonce = secureNonce()
-        val option: CredentialOption = GetSignInWithGoogleOption.Builder(BuildConfig.GOOGLE_WEB_CLIENT_ID)
+        val option = GetGoogleIdOption.Builder()
+            .setServerClientId(BuildConfig.GOOGLE_WEB_CLIENT_ID)
+            .setFilterByAuthorizedAccounts(false)
+            .setAutoSelectEnabled(false)
             .setNonce(nonce)
             .build()
         val request = GetCredentialRequest.Builder()
@@ -66,18 +86,36 @@ class GoogleAccountManager(private val activity: ComponentActivity) {
             .build()
         val response = try {
             credentialManager.getCredential(activity, request)
-        } catch (_: GetCredentialCancellationException) {
-            throw GoogleSignInCancelledException()
-        } catch (_: NoCredentialException) {
-            throw AccountAuthenticationRequiredException()
+        } catch (error: GetCredentialCancellationException) {
+            logCredentialFailure(error)
+            throw GoogleSignInCancelledException(error)
+        } catch (error: NoCredentialException) {
+            logCredentialFailure(error)
+            throw AccountAuthenticationRequiredException(error)
+        } catch (error: GetCredentialInterruptedException) {
+            logCredentialFailure(error)
+            throw GoogleSignInInterruptedException(error)
+        } catch (error: GetCredentialProviderConfigurationException) {
+            logCredentialFailure(error)
+            throw GoogleSignInConfigurationException(error)
+        } catch (error: GetCredentialUnsupportedException) {
+            logCredentialFailure(error)
+            throw GoogleSignInUnavailableException(error)
+        } catch (error: GetCredentialException) {
+            logCredentialFailure(error)
+            throw GoogleSignInUnavailableException(error)
         }
         val credential = response.credential as? CustomCredential
             ?: throw AccountAuthenticationRequiredException()
         if (credential.type != GoogleIdTokenCredential.TYPE_GOOGLE_ID_TOKEN_CREDENTIAL) {
             throw AccountAuthenticationRequiredException()
         }
-        val googleCredential = runCatching { GoogleIdTokenCredential.createFrom(credential.data) }
-            .getOrElse { throw AccountAuthenticationRequiredException() }
+        val googleCredential = try {
+            GoogleIdTokenCredential.createFrom(credential.data)
+        } catch (error: GoogleIdTokenParsingException) {
+            Log.w(TAG, "Google returned an ID credential that could not be parsed", error)
+            throw GoogleSignInUnavailableException(error)
+        }
         val firebaseCredential = GoogleAuthProvider.getCredential(googleCredential.idToken, null)
         val result = FirebaseAuth.getInstance().signInWithCredential(firebaseCredential).awaitResult()
         return (result.user ?: throw AccountAuthenticationRequiredException()).toProfile()
@@ -96,12 +134,20 @@ class GoogleAccountManager(private val activity: ComponentActivity) {
         .also(SecureRandom()::nextBytes)
         .let { Base64.encodeToString(it, Base64.NO_WRAP or Base64.NO_PADDING or Base64.URL_SAFE) }
 
+    private fun logCredentialFailure(error: GetCredentialException) {
+        Log.w(TAG, "Credential Manager failed: ${error::class.java.simpleName}; type=${error.type}", error)
+    }
+
     private fun com.google.firebase.auth.FirebaseUser.toProfile(): GoogleAccountProfile {
         val safeEmail = email?.takeIf { it.length <= 320 }
         val safeName = displayName?.trim()?.takeIf { it.isNotEmpty() }?.take(120)
             ?: safeEmail?.substringBefore('@')?.take(120)
             ?: "Google user"
         return GoogleAccountProfile(uid = uid, displayName = safeName, email = safeEmail)
+    }
+
+    private companion object {
+        const val TAG = "OmniRelayGoogleAuth"
     }
 }
 
