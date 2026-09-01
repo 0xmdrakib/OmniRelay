@@ -30,8 +30,17 @@ android {
         buildConfigField("String", "GOOGLE_WEB_CLIENT_ID", providers.gradleProperty("OMNIRELAY_GOOGLE_WEB_CLIENT_ID").orElse("").get().asBuildConfigString())
     }
 
+    val testKeystore = providers.gradleProperty("OMNIRELAY_TEST_KEYSTORE_FILE").orNull
     val releaseKeystore = providers.gradleProperty("OMNIRELAY_KEYSTORE_FILE").orNull
     signingConfigs {
+        if (!testKeystore.isNullOrBlank()) {
+            create("test") {
+                storeFile = file(testKeystore)
+                storePassword = providers.gradleProperty("OMNIRELAY_TEST_KEYSTORE_PASSWORD").get()
+                keyAlias = providers.gradleProperty("OMNIRELAY_TEST_KEY_ALIAS").get()
+                keyPassword = providers.gradleProperty("OMNIRELAY_TEST_KEY_PASSWORD").get()
+            }
+        }
         if (!releaseKeystore.isNullOrBlank()) {
             create("production") {
                 storeFile = file(releaseKeystore)
@@ -42,6 +51,9 @@ android {
         }
     }
     buildTypes {
+        debug {
+            signingConfigs.findByName("test")?.let { signingConfig = it }
+        }
         release {
             isMinifyEnabled = true
             isShrinkResources = true
