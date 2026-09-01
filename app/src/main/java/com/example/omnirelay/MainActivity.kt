@@ -22,8 +22,10 @@ import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.Send
 import androidx.compose.material.icons.automirrored.filled.VolumeOff
@@ -41,6 +43,7 @@ import androidx.compose.ui.draw.shadow
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
@@ -400,12 +403,15 @@ fun GoogleSignInScreen(
         contentAlignment = Alignment.Center
     ) {
         Card(
-            modifier = Modifier.fillMaxWidth().widthIn(max = 480.dp),
+            modifier = Modifier
+                .fillMaxWidth()
+                .widthIn(max = 480.dp)
+                .verticalScroll(rememberScrollState()),
             shape = RoundedCornerShape(30.dp),
             colors = CardDefaults.cardColors(containerColor = Color.White),
             elevation = CardDefaults.cardElevation(defaultElevation = 4.dp)
         ) {
-            Column(modifier = Modifier.padding(30.dp), horizontalAlignment = Alignment.CenterHorizontally) {
+            Column(modifier = Modifier.padding(28.dp), horizontalAlignment = Alignment.CenterHorizontally) {
                 Box(
                     modifier = Modifier
                         .size(64.dp)
@@ -421,20 +427,52 @@ fun GoogleSignInScreen(
                     )
                 }
                 Spacer(Modifier.height(20.dp))
-                Text("Welcome to OmniRelay", fontWeight = FontWeight.Black, fontSize = 24.sp, color = Color(0xFF1E1C2E))
+                Text(
+                    "Stay connected, privately.",
+                    fontWeight = FontWeight.Black,
+                    fontSize = 25.sp,
+                    color = Color(0xFF1E1C2E)
+                )
                 Spacer(Modifier.height(8.dp))
                 Text(
-                    "Sign in before messaging or calling. Your Google account controls access; " +
-                        "your E2EE Secret Link and private keys remain protected on this device.",
+                    "Sign in to invite people you trust and keep your secure contacts ready when you need them.",
                     color = Color(0xFF7E7E9A),
                     fontSize = 13.sp,
-                    lineHeight = 20.sp
+                    lineHeight = 20.sp,
+                    textAlign = androidx.compose.ui.text.style.TextAlign.Center
+                )
+                Spacer(Modifier.height(22.dp))
+                SignInBenefitRow(
+                    icon = Icons.Default.PersonAdd,
+                    title = "Invite trusted contacts",
+                    description = "Connect by Google email—no public contact directory."
+                )
+                Spacer(Modifier.height(10.dp))
+                SignInBenefitRow(
+                    icon = Icons.Default.Lock,
+                    title = "Private by default",
+                    description = "Your messages and calls stay end-to-end encrypted."
+                )
+                Spacer(Modifier.height(10.dp))
+                SignInBenefitRow(
+                    icon = Icons.Default.Sync,
+                    title = "Your contacts stay with you",
+                    description = "Keep invitations and mutual contacts linked to your account."
                 )
                 if (message != null) {
                     Spacer(Modifier.height(14.dp))
-                    Text(message, color = Color(0xFFFF5A5F), fontSize = 12.sp)
+                    Text(
+                        message,
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .background(Color(0xFFFFF0F0), RoundedCornerShape(12.dp))
+                            .padding(horizontal = 14.dp, vertical = 11.dp),
+                        color = Color(0xFFB4232D),
+                        fontSize = 12.sp,
+                        lineHeight = 17.sp
+                    )
                 }
-                Spacer(Modifier.height(24.dp))
+                Spacer(Modifier.height(20.dp))
                 Button(
                     onClick = onSignIn,
                     enabled = !isLoading,
@@ -442,7 +480,9 @@ fun GoogleSignInScreen(
                     shape = RoundedCornerShape(14.dp),
                     colors = ButtonDefaults.buttonColors(
                         containerColor = Color(0xFF1E1C2E),
-                        contentColor = Color.White
+                        contentColor = Color.White,
+                        disabledContainerColor = Color(0xFF1E1C2E),
+                        disabledContentColor = Color.White
                     )
                 ) {
                     if (isLoading) {
@@ -461,12 +501,43 @@ fun GoogleSignInScreen(
                 }
                 Spacer(Modifier.height(16.dp))
                 Text(
-                    "The relay stores only the verified account UID for device ownership—never your Google password.",
+                    "Google verifies your account. OmniRelay never receives your Google password.",
                     color = Color(0xFF9A9AB0),
                     fontSize = 11.sp,
-                    lineHeight = 16.sp
+                    lineHeight = 16.sp,
+                    textAlign = androidx.compose.ui.text.style.TextAlign.Center
                 )
             }
+        }
+    }
+}
+
+@Composable
+private fun SignInBenefitRow(
+    icon: ImageVector,
+    title: String,
+    description: String
+) {
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .background(Color(0xFFF7F6FA), RoundedCornerShape(16.dp))
+            .padding(13.dp),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        Box(
+            modifier = Modifier
+                .size(38.dp)
+                .background(Color(0xFFECE8FF), RoundedCornerShape(12.dp)),
+            contentAlignment = Alignment.Center
+        ) {
+            Icon(icon, contentDescription = null, tint = Color(0xFF5C4BC8), modifier = Modifier.size(19.dp))
+        }
+        Spacer(Modifier.width(12.dp))
+        Column {
+            Text(title, color = Color(0xFF1E1C2E), fontWeight = FontWeight.Bold, fontSize = 13.sp)
+            Spacer(Modifier.height(2.dp))
+            Text(description, color = Color(0xFF74748A), fontSize = 11.sp, lineHeight = 16.sp)
         }
     }
 }
