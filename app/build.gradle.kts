@@ -7,6 +7,11 @@ plugins {
 
 fun String.asBuildConfigString(): String = "\"${replace("\\", "\\\\").replace("\"", "\\\"")}\""
 
+val backendBaseUrl = providers.gradleProperty("OMNIRELAY_BACKEND_URL")
+    .orElse("https://relay.example.invalid")
+val debugBackendBaseUrl = providers.gradleProperty("OMNIRELAY_DEBUG_BACKEND_URL")
+    .orElse(backendBaseUrl)
+
 android {
     namespace = "com.example.omnirelay"
     compileSdk = 36
@@ -19,9 +24,7 @@ android {
         buildConfigField(
             "String",
             "BACKEND_BASE_URL",
-            providers.gradleProperty("OMNIRELAY_BACKEND_URL")
-                .orElse("https://relay.example.invalid")
-                .get().trimEnd('/').asBuildConfigString()
+            backendBaseUrl.get().trimEnd('/').asBuildConfigString()
         )
         buildConfigField("String", "FIREBASE_API_KEY", providers.gradleProperty("OMNIRELAY_FIREBASE_API_KEY").orElse("").get().asBuildConfigString())
         buildConfigField("String", "FIREBASE_APP_ID", providers.gradleProperty("OMNIRELAY_FIREBASE_APP_ID").orElse("").get().asBuildConfigString())
@@ -52,6 +55,11 @@ android {
     }
     buildTypes {
         debug {
+            buildConfigField(
+                "String",
+                "BACKEND_BASE_URL",
+                debugBackendBaseUrl.get().trimEnd('/').asBuildConfigString()
+            )
             signingConfigs.findByName("test")?.let { signingConfig = it }
         }
         release {

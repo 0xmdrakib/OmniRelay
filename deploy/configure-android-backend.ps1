@@ -23,8 +23,12 @@ $lines = [System.Collections.Generic.List[string]]::new()
 if (Test-Path -LiteralPath $propertiesPath) {
     foreach ($line in Get-Content -LiteralPath $propertiesPath) { $lines.Add([string]$line) }
 }
-$name = "OMNIRELAY_BACKEND_URL"
+$name = "OMNIRELAY_DEBUG_BACKEND_URL"
 $entry = "$name=$($BackendUrl.TrimEnd('/'))"
+$legacyName = "OMNIRELAY_BACKEND_URL"
+for ($i = $lines.Count - 1; $i -ge 0; $i--) {
+    if ($lines[$i].StartsWith("$legacyName=")) { $lines.RemoveAt($i) }
+}
 $index = -1
 for ($i = 0; $i -lt $lines.Count; $i++) {
     if ($lines[$i].StartsWith("$name=")) { $index = $i; break }
