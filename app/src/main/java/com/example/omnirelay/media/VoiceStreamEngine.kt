@@ -51,7 +51,15 @@ class VoiceStreamEngine(
     private data class IncomingVoiceFrame(val isPcm: Boolean, val bytes: ByteArray)
 
     private val jitterBuffer = ArrayBlockingQueue<IncomingVoiceFrame>(MAX_JITTER_FRAMES)
-    private val scope = CoroutineScope(Dispatchers.Default + SupervisorJob())
+    private val scope = CoroutineScope(
+        Dispatchers.Default + SupervisorJob() + CoroutineExceptionHandler { _, error ->
+            when (error) {
+                is VirtualMachineError -> throw error
+                is ThreadDeath -> throw error
+                else -> Log.e(TAG, "Voice subsystem failed without terminating the app", error)
+            }
+        }
+    )
 
     private val _isCallActive = MutableStateFlow(false)
     val isCallActive: StateFlow<Boolean> = _isCallActive.asStateFlow()

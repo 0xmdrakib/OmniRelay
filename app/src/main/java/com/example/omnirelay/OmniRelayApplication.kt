@@ -11,6 +11,7 @@ import com.google.firebase.FirebaseApp
 import com.google.firebase.FirebaseOptions
 import com.google.firebase.messaging.FirebaseMessaging
 import com.example.omnirelay.network.RelaySyncWorker
+import com.example.omnirelay.diagnostics.CrashDiagnostics
 import org.conscrypt.Conscrypt
 import java.security.Security
 import java.util.concurrent.TimeUnit
@@ -18,6 +19,7 @@ import java.util.concurrent.TimeUnit
 class OmniRelayApplication : Application() {
     override fun onCreate() {
         super.onCreate()
+        CrashDiagnostics.install(this)
         installModernCryptoProvider()
         initializeFirebaseIfConfigured()
         schedulePeriodicRelaySync()
@@ -25,8 +27,13 @@ class OmniRelayApplication : Application() {
 
     private fun installModernCryptoProvider() {
         if (Security.getProvider("Conscrypt") == null) {
-            val position = Security.insertProviderAt(Conscrypt.newProvider(), 1)
-            check(position > 0) { "Unable to install modern cryptography provider" }
+            runCatching { Security.insertProviderAt(Conscrypt.newProvider(), 1) }
+                .onSuccess { position ->
+                    if (position <= 0 && Security.getProvider("Conscrypt") == null) {
+                        Log.e("OmniRelayApplication", "Modern cryptography provider was not installed")
+                    }
+                }
+                .onFailure { Log.e("OmniRelayApplication", "Modern cryptography provider setup failed", it) }
         }
     }
 

@@ -38,6 +38,7 @@ import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.CoroutineExceptionHandler
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
@@ -174,7 +175,15 @@ class WifiAwareMeshManager(
     }
     private val identityPrefix = WifiAwareNdpProtocol.identityPrefix(this.identityPublicKey)
     private val handler = Handler(Looper.getMainLooper())
-    private val ioScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+    private val ioScope = CoroutineScope(
+        SupervisorJob() + Dispatchers.IO + CoroutineExceptionHandler { _, error ->
+            when (error) {
+                is VirtualMachineError -> throw error
+                is ThreadDeath -> throw error
+                else -> Log.e(TAG, "Wi-Fi Aware operation failed without terminating the app", error)
+            }
+        }
+    )
     /** Contact-resolved discovery candidates only; NDP still authenticates them cryptographically. */
     private val peers = ConcurrentHashMap<String, PeerState>()
     /** Unauthenticated nodes are bounded/expiring and may receive opaque relay capsules only. */
@@ -219,6 +228,16 @@ class WifiAwareMeshManager(
     var onFrameReceivedListener: ((ByteArray) -> Unit)? = null
     var onPeerDiscoveredListener: ((ByteArray) -> Unit)? = null
     var onDeliveryResultListener: ((Boolean, String) -> Unit)? = null
+
+    private fun notifyFrameReceived(packet: ByteArray) {
+        runCatching { onFrameReceivedListener?.invoke(packet) }
+            .onFailure { Log.e(TAG, "Wi-Fi Aware frame callback failed safely", it) }
+    }
+
+    private fun notifyDelivery(delivered: Boolean, detail: String) {
+        runCatching { onDeliveryResultListener?.invoke(delivered, detail) }
+            .onFailure { Log.e(TAG, "Wi-Fi Aware delivery callback failed safely", it) }
+    }
 
     val isSupported: Boolean
         get() = context.packageManager.hasSystemFeature(PackageManager.FEATURE_WIFI_AWARE)
@@ -345,11 +364,11 @@ class WifiAwareMeshManager(
             }
 
             override fun onMessageSendSucceeded(messageId: Int) {
-                onDeliveryResultListener?.invoke(true, "Wi-Fi Aware signaling delivered")
+                notifyDelivery(true, "Wi-Fi Aware signaling delivered")
             }
 
             override fun onMessageSendFailed(messageId: Int) {
-                onDeliveryResultListener?.invoke(false, "Wi-Fi Aware signaling failed")
+                notifyDelivery(false, "Wi-Fi Aware signaling failed")
             }
 
             override fun onSessionTerminated() {
@@ -417,11 +436,11 @@ class WifiAwareMeshManager(
             }
 
             override fun onMessageSendSucceeded(messageId: Int) {
-                onDeliveryResultListener?.invoke(true, "Wi-Fi Aware signaling delivered")
+                notifyDelivery(true, "Wi-Fi Aware signaling delivered")
             }
 
             override fun onMessageSendFailed(messageId: Int) {
-                onDeliveryResultListener?.invoke(false, "Wi-Fi Aware signaling failed")
+                notifyDelivery(false, "Wi-Fi Aware signaling failed")
             }
 
             override fun onSessionTerminated() {
@@ -442,7 +461,8 @@ class WifiAwareMeshManager(
             DiscoveryRole.SUBSCRIBER -> state.subscriberEndpoint = endpoint
             DiscoveryRole.PUBLISHER -> state.publisherEndpoint = endpoint
         }
-        onPeerDiscoveredListener?.invoke(prefixCopy)
+        runCatching { onPeerDiscoveredListener?.invoke(prefixCopy) }
+            .onFailure { Log.e(TAG, "Wi-Fi Aware peer callback failed safely", it) }
         if (endpoint.role == DiscoveryRole.SUBSCRIBER && attachmentDesired) {
             val queue = pendingQueues[prefixCopy.toHex()]
             val shouldResume = queue != null && synchronized(queue) {
@@ -497,7 +517,7 @@ class WifiAwareMeshManager(
         }
 
         fragmentAssembler.accept(peerHandle.hashCode().toString(), message)?.let { packet ->
-            if (packet.isNotEmpty()) onFrameReceivedListener?.invoke(packet)
+            if (packet.isNotEmpty()) notifyFrameReceived(packet)
         }
     }
 
@@ -954,7 +974,7 @@ class WifiAwareMeshManager(
         pendingQueues[setup.peerKey]?.let { queue ->
             synchronized(queue) { queue.setupConnectionId = null }
         }
-        onDeliveryResultListener?.invoke(true, "Secure Wi-Fi Aware data path ready")
+        notifyDelivery(true, "Secure Wi-Fi Aware data path ready")
         startChannelReader(candidate)
         flushPendingToChannel(setup.peerKey, candidate)
     }
@@ -964,7 +984,7 @@ class WifiAwareMeshManager(
             val failure = runCatching {
                 while (!closing && channels[channel.peerKey] === channel) {
                     val packet = WifiAwareNdpProtocol.readPacket(channel.input, channel.reader) ?: break
-                    onFrameReceivedListener?.invoke(packet)
+                    notifyFrameReceived(packet)
                 }
             }.exceptionOrNull()
             if (failure != null && failure !is SocketTimeoutException) {
@@ -1090,7 +1110,7 @@ class WifiAwareMeshManager(
         ) {
             peers[setup.peerKey]?.let { fallbackPending(setup.peerKey, it) }
         }
-        if (!closing) onDeliveryResultListener?.invoke(false, reason)
+        if (!closing) notifyDelivery(false, reason)
     }
 
     private fun closeChannel(channel: SecureChannel, reason: String, notify: Boolean) {
@@ -1099,7 +1119,7 @@ class WifiAwareMeshManager(
             return
         }
         channel.closeTransport()
-        if (notify && !closing) onDeliveryResultListener?.invoke(false, reason)
+        if (notify && !closing) notifyDelivery(false, reason)
     }
 
     private fun closePeerChannel(peerKey: String, reason: String, notify: Boolean) {

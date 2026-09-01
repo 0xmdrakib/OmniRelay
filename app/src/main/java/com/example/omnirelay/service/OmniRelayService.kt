@@ -1,5 +1,6 @@
 package com.example.omnirelay.service
 
+import android.Manifest
 import android.app.NotificationChannel
 import android.app.Notification
 import android.app.NotificationManager
@@ -25,6 +26,7 @@ import androidx.work.OneTimeWorkRequestBuilder
 import androidx.work.WorkManager
 import androidx.core.app.NotificationCompat
 import androidx.core.app.Person
+import androidx.core.content.ContextCompat
 import com.example.omnirelay.MainActivity
 import com.example.omnirelay.R
 import com.example.omnirelay.auth.AccountAuthenticationRequiredException
@@ -64,6 +66,7 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.CoroutineExceptionHandler
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.Job
@@ -179,7 +182,15 @@ class OmniRelayService : Service() {
     private val voiceCounterLock = Any()
     private val activeCallId: String? get() = callState.snapshot()?.callId
     private val activePeerPublicKey: ByteArray? get() = callState.snapshot()?.peerPublicKey
-    private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+    private val serviceScope = CoroutineScope(
+        SupervisorJob() + Dispatchers.IO + CoroutineExceptionHandler { _, error ->
+            when (error) {
+                is VirtualMachineError -> throw error
+                is ThreadDeath -> throw error
+                else -> Log.e(TAG, "A relay subsystem failed without terminating the app", error)
+            }
+        }
+    )
     private lateinit var database: OmniDatabase
     private lateinit var relayClient: InternetRelayClient
     private lateinit var telecomCallManager: TelecomCallManager
@@ -239,7 +250,8 @@ class OmniRelayService : Service() {
         }
         try {
             initializeRuntime()
-        } catch (error: Exception) {
+        } catch (error: Throwable) {
+            if (error is VirtualMachineError || error is ThreadDeath) throw error
             initializationFailed = true
             Log.e(TAG, "Relay runtime initialization failed safely", error)
             stopForeground(STOP_FOREGROUND_REMOVE)
@@ -394,6 +406,7 @@ class OmniRelayService : Service() {
             applyResourcePolicy()
             START_STICKY
         }.getOrElse { error ->
+            if (error is VirtualMachineError || error is ThreadDeath) throw error
             initializationFailed = true
             Log.e(TAG, "Foreground relay startup failed safely", error)
             stopSelf()
@@ -614,86 +627,132 @@ class OmniRelayService : Service() {
     }
 
     private fun applyResourcePolicy(): AdaptiveResourcePolicy.Decision {
-        val decision = AdaptiveResourcePolicy.evaluate(
-            resourceMonitor.snapshot(
-                settingsManager,
-                isForeground = appInForeground,
-                isCallActive = voiceEngine.isCallActive.value || activeCallId != null
+        val callActive = voiceEngine.isCallActive.value || activeCallId != null
+        val decision = runCatching {
+            AdaptiveResourcePolicy.evaluate(
+                resourceMonitor.snapshot(
+                    settingsManager,
+                    isForeground = appInForeground,
+                    isCallActive = callActive
+                )
             )
-        )
-        val activeOwnerUse = appInForeground || voiceEngine.isCallActive.value || activeCallId != null
-        wifiAwareMeshManager.setHighBandwidthNdpAllowed(
-            decision.isHighBandwidthNearbyTransferAllowed
-        )
-        bleScanDutyJob?.cancel()
-        bleScanDutyJob = null
-        bleAdvertiseDutyJob?.cancel()
-        bleAdvertiseDutyJob = null
-        if (!settingsManager.isBleEnabled || !decision.advertiseDutyCycle.isEnabled) {
-            bleMeshManager.stopActiveScanning()
-            bleMeshManager.stopAdvertising()
-            OmniRelayBackgroundScanner.unregisterPendingIntentScanner(this)
-        } else {
-            if (activeOwnerUse && decision.scanDutyCycle.isEnabled) {
-                bleMeshManager.startActiveScanning(
-                    if (decision.isHighBandwidthNearbyTransferAllowed) {
-                        ScanSettings.SCAN_MODE_LOW_LATENCY
-                    } else {
-                        ScanSettings.SCAN_MODE_BALANCED
-                    }
+        }.getOrElse { error ->
+            Log.e(TAG, "Resource telemetry failed; applying conservative policy", error)
+            AdaptiveResourcePolicy.evaluate(
+                AdaptiveResourcePolicy.Inputs(
+                    isForeground = appInForeground,
+                    isCallActive = callActive
                 )
-            } else if (decision.isThirdPartyRelayAllowed && decision.scanDutyCycle.isEnabled) {
-                bleMeshManager.stopActiveScanning()
-                bleScanDutyJob = serviceScope.launch {
-                    val onMillis = decision.scanDutyCycle.onDurationMillis
-                    val offMillis = decision.scanDutyCycle.periodMillis - onMillis
-                    while (true) {
-                        bleMeshManager.startActiveScanning(ScanSettings.SCAN_MODE_LOW_POWER)
-                        delay(onMillis)
-                        bleMeshManager.stopActiveScanning()
-                        if (offMillis > 0) delay(offMillis)
-                    }
-                }
-            } else {
-                bleMeshManager.stopActiveScanning()
-            }
-            val presence = OmniFrame(
-                payloadType = OmniFrame.PAYLOAD_TYPE_PRESENCE,
-                ephemeralPublicKey = keyPair.publicKey
-            ).packCompact()
-            if (activeOwnerUse) {
-                bleMeshManager.startAdvertising(
-                    presence,
-                    advertiseMode = AdvertiseSettings.ADVERTISE_MODE_BALANCED,
-                    txPowerLevel = AdvertiseSettings.ADVERTISE_TX_POWER_MEDIUM
-                )
-            } else {
-                bleMeshManager.stopAdvertising()
-                bleAdvertiseDutyJob = serviceScope.launch {
-                    val onMillis = decision.advertiseDutyCycle.onDurationMillis
-                    val offMillis = decision.advertiseDutyCycle.periodMillis - onMillis
-                    while (true) {
-                        bleMeshManager.startAdvertising(
-                            presence,
-                            advertiseMode = AdvertiseSettings.ADVERTISE_MODE_LOW_POWER,
-                            txPowerLevel = AdvertiseSettings.ADVERTISE_TX_POWER_LOW
-                        )
-                        delay(onMillis)
-                        bleMeshManager.stopAdvertising()
-                        if (offMillis > 0L) delay(offMillis)
-                    }
-                }
-            }
-            OmniRelayBackgroundScanner.registerPendingIntentScanner(this)
+            )
         }
-        if (settingsManager.isWifiAwareEnabled && decision.scanDutyCycle.isEnabled &&
-            (activeOwnerUse || decision.isThirdPartyRelayAllowed)
-        ) {
-            wifiAwareMeshManager.attachToNANCluster()
-        } else {
-            wifiAwareMeshManager.pause()
+        val activeOwnerUse = appInForeground || callActive
+        val bleAllowed = settingsManager.isBleEnabled && hasBleTransportPermissions()
+        val wifiAwareAllowed = settingsManager.isWifiAwareEnabled && hasWifiAwareTransportPermission()
+
+        runCatching {
+            wifiAwareMeshManager.setHighBandwidthNdpAllowed(
+                wifiAwareAllowed && decision.isHighBandwidthNearbyTransferAllowed
+            )
+            bleScanDutyJob?.cancel()
+            bleScanDutyJob = null
+            bleAdvertiseDutyJob?.cancel()
+            bleAdvertiseDutyJob = null
+            if (!bleAllowed || !decision.advertiseDutyCycle.isEnabled) {
+                bleMeshManager.stopActiveScanning()
+                bleMeshManager.stopAdvertising()
+                OmniRelayBackgroundScanner.unregisterPendingIntentScanner(this)
+            } else {
+                if (activeOwnerUse && decision.scanDutyCycle.isEnabled) {
+                    bleMeshManager.startActiveScanning(
+                        if (decision.isHighBandwidthNearbyTransferAllowed) {
+                            ScanSettings.SCAN_MODE_LOW_LATENCY
+                        } else {
+                            ScanSettings.SCAN_MODE_BALANCED
+                        }
+                    )
+                } else if (decision.isThirdPartyRelayAllowed && decision.scanDutyCycle.isEnabled) {
+                    bleMeshManager.stopActiveScanning()
+                    bleScanDutyJob = serviceScope.launch {
+                        val onMillis = decision.scanDutyCycle.onDurationMillis
+                        val offMillis = decision.scanDutyCycle.periodMillis - onMillis
+                        while (true) {
+                            bleMeshManager.startActiveScanning(ScanSettings.SCAN_MODE_LOW_POWER)
+                            delay(onMillis)
+                            bleMeshManager.stopActiveScanning()
+                            if (offMillis > 0) delay(offMillis)
+                        }
+                    }
+                } else {
+                    bleMeshManager.stopActiveScanning()
+                }
+                val presence = OmniFrame(
+                    payloadType = OmniFrame.PAYLOAD_TYPE_PRESENCE,
+                    ephemeralPublicKey = keyPair.publicKey
+                ).packCompact()
+                if (activeOwnerUse) {
+                    bleMeshManager.startAdvertising(
+                        presence,
+                        advertiseMode = AdvertiseSettings.ADVERTISE_MODE_BALANCED,
+                        txPowerLevel = AdvertiseSettings.ADVERTISE_TX_POWER_MEDIUM
+                    )
+                } else {
+                    bleMeshManager.stopAdvertising()
+                    bleAdvertiseDutyJob = serviceScope.launch {
+                        val onMillis = decision.advertiseDutyCycle.onDurationMillis
+                        val offMillis = decision.advertiseDutyCycle.periodMillis - onMillis
+                        while (true) {
+                            bleMeshManager.startAdvertising(
+                                presence,
+                                advertiseMode = AdvertiseSettings.ADVERTISE_MODE_LOW_POWER,
+                                txPowerLevel = AdvertiseSettings.ADVERTISE_TX_POWER_LOW
+                            )
+                            delay(onMillis)
+                            bleMeshManager.stopAdvertising()
+                            if (offMillis > 0L) delay(offMillis)
+                        }
+                    }
+                }
+                OmniRelayBackgroundScanner.registerPendingIntentScanner(this)
+            }
+            if (wifiAwareAllowed && decision.scanDutyCycle.isEnabled &&
+                (activeOwnerUse || decision.isThirdPartyRelayAllowed)
+            ) {
+                wifiAwareMeshManager.attachToNANCluster()
+            } else {
+                wifiAwareMeshManager.pause()
+            }
+        }.onFailure { error ->
+            Log.e(TAG, "A nearby transport was disabled after a device-specific failure", error)
+            runCatching { bleMeshManager.stopActiveScanning() }
+            runCatching { bleMeshManager.stopAdvertising() }
+            runCatching { wifiAwareMeshManager.pause() }
         }
         return decision
+    }
+
+    private fun hasBleTransportPermissions(): Boolean {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.S) {
+            return ContextCompat.checkSelfPermission(this, Manifest.permission.ACCESS_FINE_LOCATION) ==
+                android.content.pm.PackageManager.PERMISSION_GRANTED
+        }
+        return listOf(
+            Manifest.permission.BLUETOOTH_SCAN,
+            Manifest.permission.BLUETOOTH_ADVERTISE,
+            Manifest.permission.BLUETOOTH_CONNECT
+        ).all { permission ->
+            ContextCompat.checkSelfPermission(this, permission) ==
+                android.content.pm.PackageManager.PERMISSION_GRANTED
+        }
+    }
+
+    private fun hasWifiAwareTransportPermission(): Boolean {
+        val permission = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            Manifest.permission.NEARBY_WIFI_DEVICES
+        } else {
+            Manifest.permission.ACCESS_FINE_LOCATION
+        }
+        return ContextCompat.checkSelfPermission(this, permission) ==
+            android.content.pm.PackageManager.PERMISSION_GRANTED
     }
 
     fun setActiveConversation(secretLink: String?) {
@@ -804,10 +863,14 @@ class OmniRelayService : Service() {
     }.getOrNull()
 
     private fun sendNearbyFrame(targetPublicKey: ByteArray, packed: ByteArray): Boolean {
-        if (settingsManager.isWifiAwareEnabled && wifiAwareMeshManager.sendFrame(targetPublicKey, packed)) {
+        if (settingsManager.isWifiAwareEnabled && hasWifiAwareTransportPermission() &&
+            runCatching { wifiAwareMeshManager.sendFrame(targetPublicKey, packed) }.getOrDefault(false)
+        ) {
             return true
         }
-        if (settingsManager.isBleEnabled && bleMeshManager.sendFrame(targetPublicKey, packed)) {
+        if (settingsManager.isBleEnabled && hasBleTransportPermissions() &&
+            runCatching { bleMeshManager.sendFrame(targetPublicKey, packed) }.getOrDefault(false)
+        ) {
             return true
         }
         if (!settingsManager.isMeshRelayEnabled) return false
@@ -830,8 +893,12 @@ class OmniRelayService : Service() {
 
     private fun broadcastNearbyPacket(packet: ByteArray): Int {
         var neighbors = 0
-        if (settingsManager.isWifiAwareEnabled) neighbors += wifiAwareMeshManager.broadcastPacket(packet)
-        if (settingsManager.isBleEnabled) neighbors += bleMeshManager.broadcastPacket(packet)
+        if (settingsManager.isWifiAwareEnabled && hasWifiAwareTransportPermission()) {
+            neighbors += runCatching { wifiAwareMeshManager.broadcastPacket(packet) }.getOrDefault(0)
+        }
+        if (settingsManager.isBleEnabled && hasBleTransportPermissions()) {
+            neighbors += runCatching { bleMeshManager.broadcastPacket(packet) }.getOrDefault(0)
+        }
         return neighbors
     }
 

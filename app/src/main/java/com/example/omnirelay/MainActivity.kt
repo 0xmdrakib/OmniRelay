@@ -13,6 +13,7 @@ import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.core.content.ContextCompat
+import androidx.core.view.WindowCompat
 import androidx.compose.animation.*
 import androidx.compose.animation.core.*
 import androidx.compose.foundation.Canvas
@@ -33,6 +34,7 @@ import androidx.compose.material.icons.automirrored.filled.VolumeOff
 import androidx.compose.material.icons.automirrored.filled.VolumeUp
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.automirrored.filled.PhoneMissed
+import androidx.compose.material.icons.automirrored.filled.Logout
 import androidx.compose.material.icons.filled.*
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
@@ -44,6 +46,7 @@ import androidx.compose.ui.draw.shadow
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.text.font.FontFamily
@@ -51,6 +54,7 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.example.omnirelay.data.local.MessageEntity
+import com.example.omnirelay.diagnostics.CrashDiagnostics
 import com.example.omnirelay.auth.GoogleAccountManager
 import com.example.omnirelay.auth.GoogleAccountProfile
 import com.example.omnirelay.auth.GoogleSignInConfigurationException
@@ -116,6 +120,7 @@ class MainActivity : ComponentActivity() {
     private var pendingPermissionRationale by mutableStateOf<PermissionRequestGroup?>(null)
     private var identityStartupError by mutableStateOf<String?>(null)
     private var relayRuntimeMessage by mutableStateOf<String?>(null)
+    private var relayStartRequested = false
     private lateinit var googleAccountManager: GoogleAccountManager
     private var accountUiState by mutableStateOf<AccountUiState>(AccountUiState.Unconfigured)
 
@@ -131,7 +136,11 @@ class MainActivity : ComponentActivity() {
             }
             omniService = readyService
             relayRuntimeMessage = null
-            readyService.setAppInForeground(activityStarted)
+            runCatching { readyService.setAppInForeground(activityStarted) }
+                .onFailure { error ->
+                    relayRuntimeMessage = "A device transport could not start. Internet messaging remains available."
+                    Log.e("OmniRelayLifecycle", "Unable to apply foreground relay policy", error)
+                }
         }
 
         override fun onServiceDisconnected(name: ComponentName?) {
@@ -158,11 +167,21 @@ class MainActivity : ComponentActivity() {
         ActivityResultContracts.RequestMultiplePermissions()
     ) {
         permissionRevision++
-        omniService?.refreshConfiguration()
+        runCatching { omniService?.refreshConfiguration() }
+            .onFailure { Log.e("OmniRelayLifecycle", "Permission refresh failed safely", it) }
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        applyLightSystemBars()
+        CrashDiagnostics.consumePreviousCrash(this)?.let { crash ->
+            Log.e(
+                "OmniRelayCrash",
+                "Recovered previous crash ${crash.reference}: ${crash.exceptionType} on ${crash.threadName}\n${crash.stack}"
+            )
+            relayRuntimeMessage =
+                "OmniRelay recovered from an unexpected device-runtime error. Reference ${crash.reference}."
+        }
         identityStartupError = runCatching {
             SettingsManager(this, observeExternalChanges = false).use { settings ->
                 settings.getMyIdentity().privateKey.fill(0)
@@ -190,7 +209,7 @@ class MainActivity : ComponentActivity() {
             }
         }
         if (identityStartupError == null && accountUiState is AccountUiState.SignedIn) {
-            startAndBindService()
+            relayStartRequested = true
         }
 
         setContent {
@@ -260,19 +279,25 @@ class MainActivity : ComponentActivity() {
     override fun onStart() {
         super.onStart()
         activityStarted = true
-        omniService?.setAppInForeground(true)
+        runCatching { omniService?.setAppInForeground(true) }
+            .onFailure { Log.e("OmniRelayLifecycle", "Foreground transition failed safely", it) }
         if (accountUiState is AccountUiState.SignedIn && omniService == null && !isBound) {
-            startAndBindService()
+            scheduleRelayStart()
         }
     }
 
     override fun onResume() {
         super.onResume()
+        applyLightSystemBars()
         permissionRevision++
+        if (accountUiState is AccountUiState.SignedIn && omniService == null && !isBound) {
+            scheduleRelayStart()
+        }
     }
 
     override fun onStop() {
-        omniService?.setAppInForeground(false)
+        runCatching { omniService?.setAppInForeground(false) }
+            .onFailure { Log.e("OmniRelayLifecycle", "Background transition failed safely", it) }
         activityStarted = false
         super.onStop()
     }
@@ -298,6 +323,13 @@ class MainActivity : ComponentActivity() {
 
     private fun isGranted(permission: String): Boolean =
         ContextCompat.checkSelfPermission(this, permission) == android.content.pm.PackageManager.PERMISSION_GRANTED
+
+    private fun applyLightSystemBars() {
+        WindowCompat.getInsetsController(window, window.decorView).apply {
+            isAppearanceLightStatusBars = true
+            isAppearanceLightNavigationBars = true
+        }
+    }
 
     private fun showPermissionRationale(stage: PermissionStage) {
         pendingPermissionRationale = currentPermissionPlan().permissionGroups
@@ -327,6 +359,7 @@ class MainActivity : ComponentActivity() {
 
     private fun startAndBindService() {
         if (identityStartupError != null || accountUiState !is AccountUiState.SignedIn) return
+        relayStartRequested = false
         val intent = Intent(this, OmniRelayService::class.java)
         val started = runCatching { ContextCompat.startForegroundService(this, intent) }
             .onFailure {
@@ -342,6 +375,18 @@ class MainActivity : ComponentActivity() {
         if (!isBound) relayRuntimeMessage = "Secure relay is unavailable on this device."
     }
 
+    /** Starts device transports only after the credential activity has fully returned to this window. */
+    private fun scheduleRelayStart() {
+        relayStartRequested = true
+        window.decorView.post {
+            if (relayStartRequested && activityStarted &&
+                accountUiState is AccountUiState.SignedIn && omniService == null && !isBound
+            ) {
+                startAndBindService()
+            }
+        }
+    }
+
     private suspend fun performGoogleSignIn() {
         if (accountUiState is AccountUiState.SigningIn) return
         accountUiState = AccountUiState.SigningIn
@@ -353,7 +398,7 @@ class MainActivity : ComponentActivity() {
                 return
             }
             accountUiState = AccountUiState.SignedIn(profile)
-            startAndBindService()
+            scheduleRelayStart()
         } catch (_: GoogleSignInCancelledException) {
             accountUiState = AccountUiState.SignedOut(
                 "The Google account window closed before sign-in finished. Open it again and choose an account."
@@ -384,6 +429,7 @@ class MainActivity : ComponentActivity() {
 
     private suspend fun performGoogleSignOut() {
         accountUiState = AccountUiState.SigningIn
+        relayStartRequested = false
         val signOutRelayClient = InternetRelayClient(this)
         if (signOutRelayClient.isConfigured && signOutRelayClient.credentials() != null) {
             withTimeoutOrNull(3_000) {
@@ -403,11 +449,12 @@ class MainActivity : ComponentActivity() {
     }
 
     override fun onDestroy() {
-        super.onDestroy()
+        relayStartRequested = false
         if (isBound) {
             unbindService(serviceConnection)
             isBound = false
         }
+        super.onDestroy()
     }
 }
 
@@ -453,155 +500,229 @@ fun GoogleSignInScreen(
     message: String?,
     onSignIn: () -> Unit
 ) {
-    Column(
+    BoxWithConstraints(
         modifier = Modifier
             .fillMaxSize()
-            .background(Color(0xFFF8F6F0))
+            .background(Color(0xFFF6F1E7))
             .statusBarsPadding()
-            .navigationBarsPadding(),
-        horizontalAlignment = Alignment.CenterHorizontally
+            .navigationBarsPadding()
     ) {
+        val compactHeight = maxHeight < 720.dp
+        val compactWidth = maxWidth <= 380.dp
+
         Column(
-            modifier = Modifier
-                .weight(1f)
-                .fillMaxWidth()
-                .verticalScroll(rememberScrollState())
-                .padding(horizontal = 24.dp, vertical = 22.dp),
+            modifier = Modifier.fillMaxSize(),
             horizontalAlignment = Alignment.CenterHorizontally
         ) {
             Row(
-                modifier = Modifier.fillMaxWidth().widthIn(max = 420.dp),
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .widthIn(max = 460.dp)
+                    .padding(horizontal = 24.dp, vertical = if (compactHeight) 16.dp else 22.dp),
                 verticalAlignment = Alignment.CenterVertically
             ) {
                 Box(
                     modifier = Modifier
-                        .size(44.dp)
-                        .clip(RoundedCornerShape(13.dp))
-                        .background(Color(0xFF111214)),
+                        .size(40.dp)
+                        .clip(RoundedCornerShape(12.dp))
+                        .background(Color(0xFF173F38)),
                     contentAlignment = Alignment.Center
                 ) {
-                    Image(
-                        painter = painterResource(R.drawable.ic_brand_mark),
-                        contentDescription = "OmniRelay",
-                        modifier = Modifier.size(29.dp)
-                    )
+                    Box(
+                        modifier = Modifier
+                            .size(29.dp)
+                            .background(Color(0xFFFFFAF0), RoundedCornerShape(9.dp)),
+                        contentAlignment = Alignment.Center
+                    ) {
+                        Image(
+                            painter = painterResource(R.drawable.ic_brand_mark),
+                            contentDescription = "OmniRelay",
+                            modifier = Modifier.size(17.dp)
+                        )
+                    }
                 }
-                Spacer(Modifier.width(11.dp))
+                Spacer(Modifier.width(12.dp))
                 Column {
                     Text(
                         "OmniRelay",
-                        color = Color(0xFF18191B),
+                        color = Color(0xFF151817),
                         fontWeight = FontWeight.Black,
-                        fontSize = 17.sp,
-                        letterSpacing = (-0.2).sp
+                        fontSize = 18.sp,
+                        letterSpacing = (-0.3).sp
                     )
                     Text(
                         "Private messages. Resilient paths.",
-                        color = Color(0xFF77736D),
-                        fontSize = 10.sp,
-                        letterSpacing = 0.2.sp
+                        color = Color(0xFF6F716D),
+                        fontSize = 10.sp
                     )
                 }
-            }
-
-            Spacer(Modifier.height(28.dp))
-            RelaySignInArtwork()
-            Spacer(Modifier.height(28.dp))
-            Text(
-                "Stay close. Stay private.",
-                fontWeight = FontWeight.Black,
-                fontSize = 30.sp,
-                lineHeight = 35.sp,
-                letterSpacing = (-0.8).sp,
-                color = Color(0xFF18191B)
-            )
-            Spacer(Modifier.height(10.dp))
-            Text(
-                "Find trusted contacts by email, then keep every message and call end-to-end encrypted.",
-                modifier = Modifier.widthIn(max = 350.dp),
-                color = Color(0xFF6E6A64),
-                fontSize = 14.sp,
-                lineHeight = 21.sp,
-                textAlign = androidx.compose.ui.text.style.TextAlign.Center
-            )
-        }
-
-        Column(
-            modifier = Modifier
-                .fillMaxWidth()
-                .background(Color(0xFFF8F6F0))
-                .padding(horizontal = 24.dp)
-                .padding(top = 12.dp, bottom = 18.dp),
-            horizontalAlignment = Alignment.CenterHorizontally
-        ) {
-            if (message != null) {
+                Spacer(Modifier.weight(1f))
                 Surface(
-                    modifier = Modifier.fillMaxWidth().widthIn(max = 420.dp),
-                    shape = RoundedCornerShape(14.dp),
-                    color = Color(0xFFFFE9E4),
-                    border = androidx.compose.foundation.BorderStroke(1.dp, Color(0xFFFFD0C6))
+                    shape = RoundedCornerShape(50),
+                    color = Color(0xFFE6EEE8),
+                    border = androidx.compose.foundation.BorderStroke(1.dp, Color(0xFFD3DFD6))
                 ) {
                     Row(
-                        modifier = Modifier.padding(horizontal = 14.dp, vertical = 11.dp),
-                        verticalAlignment = Alignment.Top
+                        modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp),
+                        verticalAlignment = Alignment.CenterVertically
                     ) {
-                        Icon(
-                            Icons.Default.Info,
-                            contentDescription = null,
-                            tint = Color(0xFFB34838),
-                            modifier = Modifier.size(17.dp)
+                        Box(Modifier.size(6.dp).background(Color(0xFF1E9B61), CircleShape))
+                        Spacer(Modifier.width(6.dp))
+                        Text(
+                            "SECURE",
+                            color = Color(0xFF245B43),
+                            fontWeight = FontWeight.Bold,
+                            fontSize = 9.sp,
+                            letterSpacing = 0.8.sp
                         )
-                        Spacer(Modifier.width(9.dp))
-                        Text(message, color = Color(0xFF7E352B), fontSize = 11.sp, lineHeight = 16.sp)
                     }
                 }
-                Spacer(Modifier.height(12.dp))
             }
-            OutlinedButton(
-                onClick = onSignIn,
-                enabled = !isLoading,
-                modifier = Modifier.fillMaxWidth().widthIn(max = 420.dp).height(56.dp),
-                shape = RoundedCornerShape(15.dp),
-                border = androidx.compose.foundation.BorderStroke(1.dp, Color(0xFFD5D1CA)),
-                colors = ButtonDefaults.outlinedButtonColors(
-                    containerColor = Color.White,
-                    contentColor = Color(0xFF202124),
-                    disabledContainerColor = Color.White,
-                    disabledContentColor = Color(0xFF77736D)
-                )
+
+            Column(
+                modifier = Modifier
+                    .weight(1f)
+                    .fillMaxWidth()
+                    .verticalScroll(rememberScrollState())
+                    .padding(horizontal = 24.dp),
+                horizontalAlignment = Alignment.CenterHorizontally
             ) {
-                if (isLoading) {
-                    CircularProgressIndicator(
-                        modifier = Modifier.size(20.dp),
-                        color = Color(0xFF5244A2),
-                        strokeWidth = 2.dp
+                Spacer(Modifier.height(if (compactHeight) 4.dp else 14.dp))
+                PrivateSignalSeal(compact = compactHeight)
+                Spacer(Modifier.height(if (compactHeight) 18.dp else 28.dp))
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Box(Modifier.size(7.dp).background(Color(0xFFFF6F5E), CircleShape))
+                    Spacer(Modifier.width(8.dp))
+                    Text(
+                        "PRIVATE BY DESIGN",
+                        color = Color(0xFF315D54),
+                        fontWeight = FontWeight.Bold,
+                        fontSize = 10.sp,
+                        letterSpacing = 1.6.sp
                     )
-                    Spacer(Modifier.width(12.dp))
-                    Text("Opening Google…", fontWeight = FontWeight.Bold, fontSize = 14.sp)
-                } else {
-                    Image(
-                        painter = painterResource(R.drawable.ic_google_g),
-                        contentDescription = null,
-                        modifier = Modifier.size(20.dp)
-                    )
-                    Spacer(Modifier.width(12.dp))
-                    Text("Continue with Google", fontWeight = FontWeight.Bold, fontSize = 14.sp)
                 }
-            }
-            Spacer(Modifier.height(11.dp))
-            Row(verticalAlignment = Alignment.CenterVertically) {
-                Icon(
-                    Icons.Default.Lock,
-                    contentDescription = null,
-                    tint = Color(0xFF77736D),
-                    modifier = Modifier.size(13.dp)
-                )
-                Spacer(Modifier.width(6.dp))
+                Spacer(Modifier.height(12.dp))
                 Text(
-                    "Google verifies you. OmniRelay never receives your password.",
-                    color = Color(0xFF77736D),
+                    "Private by default.\nReady when you are.",
+                    modifier = Modifier.widthIn(max = 410.dp),
+                    fontWeight = FontWeight.Black,
+                    fontSize = if (compactWidth) 30.sp else 36.sp,
+                    lineHeight = if (compactWidth) 34.sp else 40.sp,
+                    letterSpacing = (-1.1).sp,
+                    color = Color(0xFF151817),
+                    textAlign = androidx.compose.ui.text.style.TextAlign.Center
+                )
+                Spacer(Modifier.height(13.dp))
+                Text(
+                    "Invite people you trust by email. Messages and calls stay sealed end to end, even when a relay carries them.",
+                    modifier = Modifier.widthIn(max = 390.dp),
+                    color = Color(0xFF666963),
+                    fontSize = 14.sp,
+                    lineHeight = 21.sp,
+                    textAlign = androidx.compose.ui.text.style.TextAlign.Center
+                )
+                if (!compactHeight) {
+                    Spacer(Modifier.height(24.dp))
+                    Surface(
+                        modifier = Modifier.widthIn(max = 390.dp),
+                        shape = RoundedCornerShape(50),
+                        color = Color(0xFFEDE8DE),
+                        border = androidx.compose.foundation.BorderStroke(1.dp, Color(0xFFDED7CA))
+                    ) {
+                        Row(
+                            modifier = Modifier.padding(horizontal = 14.dp, vertical = 9.dp),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Icon(
+                                Icons.Default.Lock,
+                                contentDescription = null,
+                                tint = Color(0xFF21483F),
+                                modifier = Modifier.size(15.dp)
+                            )
+                            Spacer(Modifier.width(8.dp))
+                            Text(
+                                "Mutual contacts only  •  End-to-end encrypted",
+                                color = Color(0xFF3E4945),
+                                fontWeight = FontWeight.Medium,
+                                fontSize = 11.sp
+                            )
+                        }
+                    }
+                }
+                Spacer(Modifier.height(if (compactHeight) 10.dp else 20.dp))
+            }
+
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .background(Color(0xFFF6F1E7))
+                    .padding(horizontal = 24.dp)
+                    .padding(top = 10.dp, bottom = 18.dp),
+                horizontalAlignment = Alignment.CenterHorizontally
+            ) {
+                if (message != null) {
+                    Surface(
+                        modifier = Modifier.fillMaxWidth().widthIn(max = 440.dp),
+                        shape = RoundedCornerShape(12.dp),
+                        color = Color(0xFFFFE9E4),
+                        border = androidx.compose.foundation.BorderStroke(1.dp, Color(0xFFF2C9BF))
+                    ) {
+                        Row(
+                            modifier = Modifier.padding(horizontal = 14.dp, vertical = 11.dp),
+                            verticalAlignment = Alignment.Top
+                        ) {
+                            Icon(
+                                Icons.Default.Info,
+                                contentDescription = null,
+                                tint = Color(0xFFA84435),
+                                modifier = Modifier.size(17.dp)
+                            )
+                            Spacer(Modifier.width(9.dp))
+                            Text(message, color = Color(0xFF75372E), fontSize = 11.sp, lineHeight = 16.sp)
+                        }
+                    }
+                    Spacer(Modifier.height(12.dp))
+                }
+                OutlinedButton(
+                    onClick = onSignIn,
+                    enabled = !isLoading,
+                    modifier = Modifier.fillMaxWidth().widthIn(max = 440.dp).height(52.dp),
+                    shape = RoundedCornerShape(10.dp),
+                    border = androidx.compose.foundation.BorderStroke(1.dp, Color(0xFF747775)),
+                    contentPadding = PaddingValues(horizontal = 14.dp),
+                    colors = ButtonDefaults.outlinedButtonColors(
+                        containerColor = Color.White,
+                        contentColor = Color(0xFF1F1F1F),
+                        disabledContainerColor = Color.White,
+                        disabledContentColor = Color(0xFF6F716D)
+                    )
+                ) {
+                    if (isLoading) {
+                        CircularProgressIndicator(
+                            modifier = Modifier.size(18.dp),
+                            color = Color(0xFF1F1F1F),
+                            strokeWidth = 2.dp
+                        )
+                        Spacer(Modifier.width(12.dp))
+                        Text("Connecting securely…", fontWeight = FontWeight.SemiBold, fontSize = 14.sp)
+                    } else {
+                        Image(
+                            painter = painterResource(R.drawable.ic_google_g),
+                            contentDescription = null,
+                            modifier = Modifier.size(18.dp)
+                        )
+                        Spacer(Modifier.width(12.dp))
+                        Text("Continue with Google", fontWeight = FontWeight.SemiBold, fontSize = 14.sp)
+                    }
+                }
+                Spacer(Modifier.height(11.dp))
+                Text(
+                    "Google verifies your account. OmniRelay never receives your password.",
+                    modifier = Modifier.widthIn(max = 400.dp),
+                    color = Color(0xFF74756F),
                     fontSize = 10.sp,
-                    lineHeight = 14.sp
+                    lineHeight = 14.sp,
+                    textAlign = androidx.compose.ui.text.style.TextAlign.Center
                 )
             }
         }
@@ -609,65 +730,51 @@ fun GoogleSignInScreen(
 }
 
 @Composable
-private fun RelaySignInArtwork() {
-    Surface(
-        modifier = Modifier
-            .fillMaxWidth()
-            .widthIn(max = 360.dp)
-            .height(210.dp),
-        shape = RoundedCornerShape(30.dp),
-        color = Color(0xFFEEEAE1),
-        border = androidx.compose.foundation.BorderStroke(1.dp, Color(0xFFE1DDD4))
-    ) {
-        Box(
-            modifier = Modifier.fillMaxSize()
+private fun PrivateSignalSeal(compact: Boolean) {
+    val sealSize = if (compact) 132.dp else 174.dp
+    Box(modifier = Modifier.size(sealSize), contentAlignment = Alignment.Center) {
+        Canvas(Modifier.fillMaxSize()) {
+            val center = Offset(size.width / 2f, size.height / 2f)
+            val radius = size.minDimension / 2f
+            drawCircle(Color(0xFFE9E2D5), radius = radius, center = center)
+            drawCircle(
+                color = Color(0xFF173F38).copy(alpha = 0.25f),
+                radius = radius * 0.78f,
+                center = center,
+                style = Stroke(width = 2f)
+            )
+            drawCircle(
+                color = Color(0xFF173F38).copy(alpha = 0.12f),
+                radius = radius * 0.58f,
+                center = center,
+                style = Stroke(width = 2f)
+            )
+            drawLine(
+                color = Color(0xFF173F38).copy(alpha = 0.42f),
+                start = Offset(radius * 0.18f, center.y),
+                end = Offset(size.width - radius * 0.18f, center.y),
+                strokeWidth = 2f
+            )
+            drawCircle(Color(0xFFFF6F5E), radius = radius * 0.055f, center = Offset(radius * 0.18f, center.y))
+            drawCircle(Color(0xFF1E9B61), radius = radius * 0.055f, center = Offset(size.width - radius * 0.18f, center.y))
+        }
+        Surface(
+            modifier = Modifier.size(if (compact) 72.dp else 88.dp),
+            shape = RoundedCornerShape(if (compact) 22.dp else 27.dp),
+            color = Color(0xFF173F38),
+            shadowElevation = 12.dp
         ) {
-            Canvas(Modifier.fillMaxSize()) {
-                val relay = Offset(size.width * 0.5f, size.height * 0.52f)
-                val left = Offset(size.width * 0.17f, size.height * 0.30f)
-                val right = Offset(size.width * 0.83f, size.height * 0.32f)
-                val lower = Offset(size.width * 0.78f, size.height * 0.77f)
-                drawLine(Color(0xFFAD9BEA), left, relay, strokeWidth = 9f)
-                drawLine(Color(0xFFFF9A7A), relay, right, strokeWidth = 9f)
-                drawLine(Color(0xFF63CBA0), relay, lower, strokeWidth = 9f)
-                drawCircle(Color(0xFFAC96F0), radius = 21f, center = left)
-                drawCircle(Color(0xFFFF8C6D), radius = 21f, center = right)
-                drawCircle(Color(0xFF47B98A), radius = 21f, center = lower)
-                drawCircle(Color.White, radius = 6f, center = left)
-                drawCircle(Color.White, radius = 6f, center = right)
-                drawCircle(Color.White, radius = 6f, center = lower)
-            }
-            Box(
-                modifier = Modifier
-                    .align(Alignment.Center)
-                    .size(76.dp)
-                    .shadow(18.dp, RoundedCornerShape(23.dp), clip = false)
-                    .background(Color(0xFF111214), RoundedCornerShape(23.dp)),
-                contentAlignment = Alignment.Center
-            ) {
-                Image(
-                    painter = painterResource(R.drawable.ic_brand_mark),
-                    contentDescription = null,
-                    modifier = Modifier.size(49.dp)
-                )
-            }
-            Surface(
-                modifier = Modifier.align(Alignment.BottomStart).padding(18.dp),
-                shape = RoundedCornerShape(20.dp),
-                color = Color.White.copy(alpha = 0.9f)
-            ) {
-                Row(
-                    modifier = Modifier.padding(horizontal = 11.dp, vertical = 7.dp),
-                    verticalAlignment = Alignment.CenterVertically
+            Box(contentAlignment = Alignment.Center) {
+                Box(
+                    modifier = Modifier
+                        .size(if (compact) 49.dp else 58.dp)
+                        .background(Color(0xFFFFFAF0), RoundedCornerShape(if (compact) 15.dp else 18.dp)),
+                    contentAlignment = Alignment.Center
                 ) {
-                    Box(Modifier.size(7.dp).background(Color(0xFF38B77A), CircleShape))
-                    Spacer(Modifier.width(7.dp))
-                    Text(
-                        "Encrypted before routing",
-                        color = Color(0xFF4C4944),
-                        fontWeight = FontWeight.Bold,
-                        fontSize = 9.sp,
-                        letterSpacing = 0.15.sp
+                    Image(
+                        painter = painterResource(R.drawable.ic_brand_mark),
+                        contentDescription = null,
+                        modifier = Modifier.size(if (compact) 27.dp else 32.dp)
                     )
                 }
             }
@@ -785,7 +892,7 @@ fun MinimalAppDashboard(
                         Image(
                             painter = painterResource(R.drawable.ic_brand_mark),
                             contentDescription = null,
-                            modifier = Modifier.size(29.dp)
+                            modifier = Modifier.size(23.dp)
                         )
                     }
                     Spacer(modifier = Modifier.width(12.dp))
@@ -1708,7 +1815,7 @@ fun SettingsScreen(
                         Text("Device identity bound to verified account", color = Color(0xFF00A884), fontSize = 10.sp)
                     }
                     TextButton(onClick = onSignOut) {
-                        Icon(Icons.Default.Logout, contentDescription = null, modifier = Modifier.size(16.dp))
+                        Icon(Icons.AutoMirrored.Filled.Logout, contentDescription = null, modifier = Modifier.size(16.dp))
                         Spacer(Modifier.width(5.dp))
                         Text("SIGN OUT", fontWeight = FontWeight.Bold, fontSize = 11.sp)
                     }

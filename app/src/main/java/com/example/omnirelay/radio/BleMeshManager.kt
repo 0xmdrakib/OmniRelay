@@ -111,10 +111,6 @@ class BleMeshManager(private val context: Context) {
     var onPeerDiscoveredListener: ((ByteArray, Int) -> Unit)? = null
     var onDeliveryResultListener: ((Boolean, String) -> Unit)? = null
 
-    init {
-        setupGattServer()
-    }
-
     @SuppressLint("MissingPermission")
     private fun setupGattServer() {
         val manager = bluetoothManager ?: return
@@ -361,7 +357,8 @@ class BleMeshManager(private val context: Context) {
             }
             discoveredPeers[key] = PeerEndpoint(result.device, prefix, now)
         }
-        onPeerDiscoveredListener?.invoke(prefix, result.rssi)
+        runCatching { onPeerDiscoveredListener?.invoke(prefix, result.rssi) }
+            .onFailure { Log.e(TAG, "BLE peer callback failed safely", it) }
     }
 
     private fun pruneDiscoveredPeers(nowMs: Long = System.currentTimeMillis()) {
@@ -415,7 +412,8 @@ class BleMeshManager(private val context: Context) {
                 failAndClose(gatt, "BLE write failed ($status)")
                 return
             }
-            onDeliveryResultListener?.invoke(true, "Delivered over BLE GATT")
+            runCatching { onDeliveryResultListener?.invoke(true, "Delivered over BLE GATT") }
+                .onFailure { Log.e(TAG, "BLE delivery callback failed safely", it) }
             drainWrites(session)
         }
     }
@@ -441,7 +439,8 @@ class BleMeshManager(private val context: Context) {
                 ingressPacketBudget.tryAcquire(1) && ingressByteBudget.tryAcquire(value.size)
             if (admitted && device != null) value.let { packet ->
                 fragmentAssembler.accept(device.address, packet)?.let { frame ->
-                    onFrameReceivedListener?.invoke(frame, -50)
+                    runCatching { onFrameReceivedListener?.invoke(frame, -50) }
+                        .onFailure { Log.e(TAG, "BLE frame callback failed safely", it) }
                 }
             }
             if (responseNeeded && device != null) {
@@ -459,7 +458,8 @@ class BleMeshManager(private val context: Context) {
     private fun failAndClose(gatt: BluetoothGatt, reason: String) {
         clientSessions.remove(gatt.device.address)
         runCatching { gatt.close() }
-        onDeliveryResultListener?.invoke(false, reason)
+        runCatching { onDeliveryResultListener?.invoke(false, reason) }
+            .onFailure { Log.e(TAG, "BLE failure callback failed safely", it) }
     }
 
     @SuppressLint("MissingPermission")
