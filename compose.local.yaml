@@ -1,0 +1,10 @@
+services:
+  coturn:
+    # Docker Desktop does not publish Linux host-network sockets to the Windows
+    # LAN reliably. Bridge mode plus explicit mappings keeps local phone tests
+    # reachable while the production Compose file retains host networking.
+    network_mode: bridge
+    ports:
+      - "${TURN_BIND_ADDRESS:-0.0.0.0}:3478:3478"
+      - "${TURN_BIND_ADDRESS:-0.0.0.0}:3478:3478/udp"
+      - "49160-49200:49160-49200/udp"

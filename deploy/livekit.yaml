@@ -5,7 +5,8 @@ rtc:
   tcp_port: 7881
   port_range_start: 50000
   port_range_end: 50100
-  use_external_ip: true
+  node_ip: "REPLACE_WITH_NODE_IP"
+  use_external_ip: REPLACE_WITH_USE_EXTERNAL_IP
   allow_tcp_fallback: true
   turn_servers:
     - host: "REPLACE_WITH_PUBLIC_HOST"
