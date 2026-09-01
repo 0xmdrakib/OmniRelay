@@ -11,7 +11,7 @@ android {
     namespace = "com.example.omnirelay"
     compileSdk = 36
     defaultConfig {
-        applicationId = "com.example.omnirelay"
+        applicationId = "xyz.rakibhq.omnirelay"
         minSdk = 26
         targetSdk = 36
         versionCode = 1

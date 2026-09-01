@@ -123,12 +123,12 @@ class OmniRelayService : Service() {
         const val IDENTITY_NOTIFICATION_ID = 0x103
         const val CALL_WAITING_NOTIFICATION_ID = 0x104
 
-        const val ACTION_ACCEPT_CALL = "com.example.omnirelay.ACTION_ACCEPT_CALL"
-        const val ACTION_DECLINE_CALL = "com.example.omnirelay.ACTION_DECLINE_CALL"
-        const val ACTION_END_CALL = "com.example.omnirelay.ACTION_END_CALL"
-        const val ACTION_SYNC_MAILBOX = "com.example.omnirelay.ACTION_SYNC_MAILBOX"
-        const val ACTION_SYNC_CONTACTS = "com.example.omnirelay.ACTION_SYNC_CONTACTS"
-        const val ACTION_UPDATE_PUSH_TOKEN = "com.example.omnirelay.ACTION_UPDATE_PUSH_TOKEN"
+        const val ACTION_ACCEPT_CALL = "xyz.rakibhq.omnirelay.ACTION_ACCEPT_CALL"
+        const val ACTION_DECLINE_CALL = "xyz.rakibhq.omnirelay.ACTION_DECLINE_CALL"
+        const val ACTION_END_CALL = "xyz.rakibhq.omnirelay.ACTION_END_CALL"
+        const val ACTION_SYNC_MAILBOX = "xyz.rakibhq.omnirelay.ACTION_SYNC_MAILBOX"
+        const val ACTION_SYNC_CONTACTS = "xyz.rakibhq.omnirelay.ACTION_SYNC_CONTACTS"
+        const val ACTION_UPDATE_PUSH_TOKEN = "xyz.rakibhq.omnirelay.ACTION_UPDATE_PUSH_TOKEN"
         const val EXTRA_PUSH_TOKEN = "push_token"
 
         private const val MAX_TEXT_BYTES = 60_000

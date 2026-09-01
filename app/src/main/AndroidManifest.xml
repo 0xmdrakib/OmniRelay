@@ -83,7 +83,7 @@
             android:enabled="true"
             android:exported="false">
             <intent-filter>
-                <action android:name="com.example.omnirelay.ACTION_BLE_SCAN_RESULT" />
+                <action android:name="xyz.rakibhq.omnirelay.ACTION_BLE_SCAN_RESULT" />
             </intent-filter>
         </receiver>
 

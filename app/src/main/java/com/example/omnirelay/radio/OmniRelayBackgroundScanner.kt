@@ -23,7 +23,7 @@ class OmniRelayBackgroundScanner : BroadcastReceiver() {
 
     companion object {
         const val TAG = "BackgroundScanner"
-        const val ACTION_BLE_SCAN_RESULT = "com.example.omnirelay.ACTION_BLE_SCAN_RESULT"
+        const val ACTION_BLE_SCAN_RESULT = "xyz.rakibhq.omnirelay.ACTION_BLE_SCAN_RESULT"
         const val REQUEST_CODE = 0x401
         private const val WAKE_DEBOUNCE_MS = 15_000L
         private const val WAKE_PREFS = "OmniRelayBackgroundWake"
