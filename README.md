@@ -78,7 +78,7 @@ exists.
 - **Cryptography:** directional X25519/HKDF/AES-256-GCM, Ed25519, and Android Keystore
 - **Connectivity:** OkHttp, Firebase Cloud Messaging, Wi-Fi Aware, and BLE GATT
 - **Voice:** LiveKit/WebRTC, coturn, lossless PCM over NDP, and IMA-ADPCM over BLE
-- **Backend:** Node.js 24, TypeScript, Fastify, WebSocket, and PostgreSQL
+- **Backend:** Node.js 24, TypeScript, Fastify, WebSocket, and managed Neon PostgreSQL
 - **Infrastructure:** Docker Compose, Caddy TLS, and GitHub Actions
 - **Public showcase:** isolated static Vite site under `website/`, configured for Vercel
 

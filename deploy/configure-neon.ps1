@@ -8,26 +8,10 @@ param(
 $ErrorActionPreference = "Stop"
 $repoRoot = Split-Path $PSScriptRoot -Parent
 $envPath = Join-Path $repoRoot ".env"
-
-function Assert-NeonUrl([string]$Value, [bool]$ExpectPooler) {
-    $uri = [Uri]$Value
-    if ($uri.Scheme -notin @("postgres", "postgresql") -or
-        -not $uri.Host.EndsWith(".neon.tech", [StringComparison]::OrdinalIgnoreCase)) {
-        throw "Expected an official Neon PostgreSQL connection URL."
-    }
-    if ($ExpectPooler -and -not $uri.Host.Contains("-pooler")) {
-        throw "Runtime DATABASE_URL must use the Neon pooled endpoint."
-    }
-    if (-not $ExpectPooler -and $uri.Host.Contains("-pooler")) {
-        throw "DATABASE_MIGRATION_URL must use the direct Neon endpoint."
-    }
-    if (-not $uri.Query.Contains("sslmode=require")) {
-        throw "Neon URLs must require TLS with sslmode=require."
-    }
-}
-
-Assert-NeonUrl $PooledDatabaseUrl $true
-Assert-NeonUrl $DirectDatabaseUrl $false
+. (Join-Path $PSScriptRoot "neon-config.ps1")
+$PooledDatabaseUrl = ConvertTo-NeonVerifyFullUrl $PooledDatabaseUrl
+$DirectDatabaseUrl = ConvertTo-NeonVerifyFullUrl $DirectDatabaseUrl
+Assert-NeonDatabasePair $PooledDatabaseUrl $DirectDatabaseUrl
 if (-not (Test-Path -LiteralPath $envPath -PathType Leaf)) {
     throw "Missing .env. Run the appropriate initialize script first."
 }

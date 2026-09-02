@@ -14,6 +14,13 @@ if (-not (Test-Path -LiteralPath $liveKitConfig)) {
 if ((Get-Content -Raw -LiteralPath $envPath) -match 'CHANGE_ME|example\.invalid') {
     throw "Deployment configuration still contains a placeholder."
 }
+. (Join-Path $PSScriptRoot "neon-config.ps1")
+$pooledDatabaseUrl = Get-DotEnvValue -Path $envPath -Name "DATABASE_URL"
+$directDatabaseUrl = Get-DotEnvValue -Path $envPath -Name "DATABASE_MIGRATION_URL"
+if ([string]::IsNullOrWhiteSpace($pooledDatabaseUrl) -or [string]::IsNullOrWhiteSpace($directDatabaseUrl)) {
+    throw "Neon is required. Run deploy/configure-neon.ps1 before starting OmniRelay."
+}
+Assert-NeonDatabasePair $pooledDatabaseUrl $directDatabaseUrl
 
 Push-Location $repoRoot
 try {
@@ -22,22 +29,11 @@ try {
     if (Test-Path -LiteralPath $firebaseKey -PathType Leaf) {
         $composeArguments += @("-f", "compose.firebase.yaml")
     }
-    $databaseUrl = Get-Content -LiteralPath $envPath |
-        Where-Object { $_.StartsWith("DATABASE_URL=") } |
-        Select-Object -First 1
-    $usingNeon = $databaseUrl -and $databaseUrl.Substring("DATABASE_URL=".Length).Contains(".neon.tech")
-    if ($usingNeon) {
-        $composeArguments += @("-f", "compose.neon.yaml")
-    }
     $composeArguments += @("--profile", "production")
 
     docker @composeArguments config --quiet
     if ($LASTEXITCODE -ne 0) { throw "Docker Compose configuration validation failed." }
-    if ($usingNeon) {
-        docker @composeArguments up -d --build --no-deps backend livekit coturn caddy
-    } else {
-        docker @composeArguments up -d --build
-    }
+    docker @composeArguments up -d --build --no-deps backend livekit coturn caddy
     if ($LASTEXITCODE -ne 0) { throw "Docker Compose deployment failed." }
 
     $deadline = (Get-Date).AddMinutes(2)
@@ -52,7 +48,7 @@ try {
     } while ((Get-Date) -lt $deadline)
 
     if (-not $healthy) {
-        throw "Relay did not become production-ready within two minutes. Check PostgreSQL and Firebase Admin configuration."
+        throw "Relay did not become production-ready within two minutes. Check Neon and Firebase Admin configuration."
     }
     docker @composeArguments ps
     Write-Output "OmniRelay production services are healthy."

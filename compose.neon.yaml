@@ -1,7 +1,0 @@
-services:
-  backend:
-    environment:
-      # Runtime traffic uses Neon's pooled endpoint; schema changes use the
-      # direct endpoint because transaction-mode pooling is not migration-safe.
-      DATABASE_URL: ${DATABASE_URL:?Set the pooled Neon DATABASE_URL in .env}
-      DATABASE_MIGRATION_URL: ${DATABASE_MIGRATION_URL:?Set the direct Neon DATABASE_MIGRATION_URL in .env}

@@ -17,6 +17,13 @@ if ((Get-Content -Raw -LiteralPath $envPath) -match "CHANGE_ME|example\.invalid"
 if ((Get-Content -Raw -LiteralPath $liveKitConfig) -match "REPLACE_WITH_") {
     throw "Generated LiveKit configuration still contains a placeholder."
 }
+. (Join-Path $PSScriptRoot "neon-config.ps1")
+$pooledDatabaseUrl = Get-DotEnvValue -Path $envPath -Name "DATABASE_URL"
+$directDatabaseUrl = Get-DotEnvValue -Path $envPath -Name "DATABASE_MIGRATION_URL"
+if ([string]::IsNullOrWhiteSpace($pooledDatabaseUrl) -or [string]::IsNullOrWhiteSpace($directDatabaseUrl)) {
+    throw "Neon is required. Run deploy/configure-neon.ps1 before starting OmniRelay."
+}
+Assert-NeonDatabasePair $pooledDatabaseUrl $directDatabaseUrl
 
 Push-Location $repoRoot
 try {
@@ -26,23 +33,12 @@ try {
         $composeArguments += @("-f", "compose.firebase.yaml")
         Write-Output "Firebase Admin key detected; account registration and push are enabled."
     }
-    $databaseUrl = Get-Content -LiteralPath $envPath |
-        Where-Object { $_.StartsWith("DATABASE_URL=") } |
-        Select-Object -First 1
-    $usingNeon = $databaseUrl -and $databaseUrl.Substring("DATABASE_URL=".Length).Contains(".neon.tech")
-    if ($usingNeon) {
-        $composeArguments += @("-f", "compose.neon.yaml")
-        Write-Output "Neon database configuration detected; local PostgreSQL will stay stopped."
-    }
+    Write-Output "Verified managed Neon runtime and migration connections."
 
     docker @composeArguments config --quiet
     if ($LASTEXITCODE -ne 0) { throw "Docker Compose configuration validation failed." }
 
-    if ($usingNeon) {
-        docker @composeArguments up -d --build --no-deps backend livekit coturn
-    } else {
-        docker @composeArguments up -d --build postgres backend livekit coturn
-    }
+    docker @composeArguments up -d --build --no-deps backend livekit coturn
     if ($LASTEXITCODE -ne 0) { throw "Docker Compose local startup failed." }
 
     $deadline = (Get-Date).AddMinutes(3)
@@ -58,7 +54,7 @@ try {
 
     if (-not $healthy) {
         docker @composeArguments ps
-        docker @composeArguments logs --tail 100 backend postgres
+        docker @composeArguments logs --tail 100 backend
         throw "Local relay did not become healthy within three minutes."
     }
 

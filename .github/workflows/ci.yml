@@ -30,6 +30,8 @@ jobs:
   backend:
     name: Backend
     runs-on: ubuntu-latest
+    # This PostgreSQL instance is ephemeral test infrastructure only. OmniRelay
+    # runtime deployments require Neon and never create a local database.
     services:
       postgres:
         image: postgres:17.10-alpine3.24
@@ -48,7 +50,7 @@ jobs:
       run:
         working-directory: backend
     env:
-      NODE_ENV: production
+      NODE_ENV: test
       DATABASE_URL: postgres://omnirelay:ci-database-password@127.0.0.1:5432/omnirelay
       LIVEKIT_URL: ws://127.0.0.1:7880
       LIVEKIT_API_KEY: ci-livekit-key

@@ -22,7 +22,8 @@ const forbiddenContent = [
   "class OmniRelayService",
   "FIREBASE_SERVICE_ACCOUNT_JSON",
   "LIVEKIT_API_SECRET",
-  "POSTGRES_PASSWORD"
+  "DATABASE_URL",
+  "DATABASE_MIGRATION_URL"
 ];
 
 for (const path of files) {

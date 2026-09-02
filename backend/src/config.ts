@@ -9,7 +9,7 @@ const schema = z.object({
   NODE_ENV: z.enum(["development", "test", "production"]).default("development"),
   PORT: z.coerce.number().int().min(1).max(65535).default(8080),
   HOST: z.string().default("0.0.0.0"),
-  DATABASE_URL: postgresUrl.default("postgres://omnirelay:omnirelay@localhost:5432/omnirelay"),
+  DATABASE_URL: postgresUrl,
   DATABASE_MIGRATION_URL: z.preprocess(
     (value) => value === "" ? undefined : value,
     postgresUrl.optional()
@@ -57,6 +57,39 @@ const schema = z.object({
 
 export type AppConfig = z.infer<typeof schema>;
 
+function assertProductionNeonConfiguration(parsed: AppConfig): void {
+  if (!parsed.DATABASE_MIGRATION_URL) {
+    throw new Error("Production requires a direct Neon DATABASE_MIGRATION_URL");
+  }
+
+  const runtime = new URL(parsed.DATABASE_URL);
+  const migration = new URL(parsed.DATABASE_MIGRATION_URL);
+  const assertNeonUrl = (value: URL, variableName: string, expectPooler: boolean): void => {
+    const isNeon = value.hostname.toLowerCase().endsWith(".neon.tech");
+    const isPooler = value.hostname.toLowerCase().includes("-pooler.");
+    if (!isNeon || isPooler !== expectPooler) {
+      const endpointType = expectPooler ? "pooled" : "direct";
+      throw new Error(`${variableName} must use the official Neon ${endpointType} endpoint`);
+    }
+    if (!value.username || !value.password || value.pathname === "/") {
+      throw new Error(`${variableName} must include a role, password, and database name`);
+    }
+    const sslMode = value.searchParams.get("sslmode")?.toLowerCase();
+    if ((sslMode !== "require" && sslMode !== "verify-full") ||
+        value.searchParams.get("channel_binding")?.toLowerCase() !== "require") {
+      throw new Error(`${variableName} must enforce TLS verification and SCRAM channel binding`);
+    }
+  };
+
+  assertNeonUrl(runtime, "DATABASE_URL", true);
+  assertNeonUrl(migration, "DATABASE_MIGRATION_URL", false);
+  const normalizedRuntimeHost = runtime.hostname.toLowerCase().replace("-pooler.", ".");
+  if (normalizedRuntimeHost !== migration.hostname.toLowerCase() ||
+      runtime.pathname !== migration.pathname || runtime.username !== migration.username) {
+    throw new Error("Runtime and migration URLs must target the same Neon project, database, and role");
+  }
+}
+
 export function parseConfig(environment: NodeJS.ProcessEnv): AppConfig {
   const parsed = schema.parse(environment);
   if (parsed.DATABASE_QUERY_TIMEOUT_MS < parsed.DATABASE_STATEMENT_TIMEOUT_MS) {
@@ -83,9 +116,7 @@ export function parseConfig(environment: NodeJS.ProcessEnv): AppConfig {
     if (parsed.LIVEKIT_API_KEY === "devkey" || parsed.LIVEKIT_API_SECRET.startsWith("devsecret-")) {
       throw new Error("Production requires non-default LiveKit credentials");
     }
-    if (parsed.DATABASE_URL.includes("omnirelay:omnirelay@localhost")) {
-      throw new Error("Production requires an explicit database password and URL");
-    }
+    assertProductionNeonConfiguration(parsed);
   }
   return parsed;
 }
