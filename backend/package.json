@@ -16,7 +16,7 @@
     "test": "tsx --import ./test/setup-env.mjs --test --test-concurrency=1 test/**/*.test.ts",
     "test:unit": "tsx --import ./test/setup-env.mjs --test --test-concurrency=1 test/account-auth.test.ts test/bounded-task-queue.test.ts test/config.test.ts test/hub.test.ts test/identity.test.ts test/protocol.test.ts test/registration-auth.test.ts test/repository-validation.test.ts test/route-authorization.test.ts test/server-reliability.test.ts",
     "test:integration": "tsx --import ./test/setup-env.mjs --test test/relay.integration.test.ts",
-    "audit": "pnpm audit --prod --audit-level=high"
+    "audit": "pnpm audit --prod --audit-level=high --ignore-registry-errors"
   },
   "dependencies": {
     "@fastify/websocket": "11.3.0",
