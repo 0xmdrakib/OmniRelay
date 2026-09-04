@@ -12,6 +12,7 @@
     "build": "tsc --noEmit && vite build",
     "preview": "vite preview",
     "check": "tsc --noEmit",
+    "audit": "pnpm audit --audit-level=low --ignore-registry-errors",
     "verify": "pnpm build && node scripts/verify-build.mjs"
   },
   "devDependencies": {

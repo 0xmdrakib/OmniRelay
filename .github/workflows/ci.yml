@@ -107,8 +107,10 @@ jobs:
         run: corepack enable
       - name: Install isolated website dependencies
         run: pnpm install --frozen-lockfile
-      - name: Audit and verify public bundle
-        run: pnpm audit --audit-level=low && pnpm verify
+      - name: Audit public dependencies
+        run: pnpm run audit
+      - name: Verify public bundle
+        run: pnpm verify
       - name: Upload Vercel-ready bundle
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
